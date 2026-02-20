@@ -1,0 +1,697 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GREMLIN Visualization</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/prop-types@15/prop-types.min.js"></script>
+  <script src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect, useCallback, useRef } = React;
+    const { LineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid, ResponsiveContainer } = Recharts;
+
+    const MAX_L = 21,
+      MAX_A = 21,
+      colorMap = [
+        "#eab308", "#3b82f6", "#22c55e", "#ef4444", "#8b5cf6",
+        "#ec4899", "#f97316", "#10b981", "#6366f1", "#f43f5e",
+        "#14b8a6", "#a855f7", "#64748b", "#f59e0b", "#2dd4bf",
+        "#f472b6", "#0ea5e9", "#84cc16", "#a78bfa", "#4b5563",
+        "#ea580c",
+      ];
+
+    const LossChart = ({ loss }) => (
+      <ResponsiveContainer width="100%" height={200}>
+        <LineChart data={loss}>
+          <CartesianGrid strokeDasharray="3 3" />
+          <XAxis
+            dataKey="iteration"
+            label={{ value: "Iterations", position: "bottom", offset: -10 }}
+          />
+          <YAxis label={{ value: "-PLL", angle: -90, position: "insideLeft" }} />
+          <Tooltip />
+          <Line type="monotone" dataKey="value" stroke="#8884d8" dot={false} />
+        </LineChart>
+      </ResponsiveContainer>
+    );
+
+    const ColoredTextEditor = ({ value, onChange, selectedSequence, setSelectedSequence }) => {
+      const textareaRef = useRef(null);
+      const displayRef = useRef(null);
+      const radioContainerRef = useRef(null);
+      const [lineCount, setLineCount] = useState(value.split("\n").length);
+      const lineHeight = 22;
+      const fontSize = 15;
+
+      useEffect(() => {
+        updateDisplay();
+        setLineCount(value.split("\n").length);
+      }, [value]);
+
+      const updateDisplay = () => {
+        if (displayRef.current) {
+          displayRef.current.innerHTML = colorText(value);
+        }
+      };
+
+      const colorText = (text) => {
+        return text
+          .split("\n")
+          .map((line) =>
+            line
+              .split("")
+              .map(
+                (char) =>
+                  `<span style="background-color: ${
+                    colorMap[Number(char)] || "transparent"
+                  }; color: ${Number(char) > 10 ? "white" : "black"}">${char}</span>`
+              )
+              .join("")
+          )
+          .join("<br>");
+      };
+
+      const handleInput = (e) => {
+        onChange(e.target.value);
+      };
+
+      const handleScroll = () => {
+        if (displayRef.current && textareaRef.current && radioContainerRef.current) {
+          displayRef.current.scrollTop = textareaRef.current.scrollTop;
+          radioContainerRef.current.scrollTop = textareaRef.current.scrollTop;
+        }
+      };
+
+      return (
+        <div style={{ display: "flex", height: "250px", width: "100%" }}>
+          <div
+            ref={radioContainerRef}
+            style={{ width: "20px", marginRight: "10px", overflowY: "hidden", position: "relative" }}
+          >
+            <div style={{ position: "absolute", top: "7px", left: 0, right: 0 }}>
+              {Array.from({ length: lineCount }, (_, i) => (
+                <div key={i} style={{ height: `${lineHeight}px`, display: "flex", alignItems: "center" }}>
+                  <input
+                    type="radio"
+                    name="selectedSequence"
+                    value={i}
+                    checked={selectedSequence === i}
+                    onChange={() => setSelectedSequence(i)}
+                    style={{ margin: 0 }}
+                  />
+                </div>
+              ))}
+            </div>
+          </div>
+          <div style={{ position: "relative", flex: 1 }}>
+            <textarea
+              ref={textareaRef}
+              value={value}
+              onChange={handleInput}
+              onScroll={handleScroll}
+              style={{
+                position: "absolute", top: 0, left: 0,
+                width: "100%", height: "250px",
+                padding: "8px", fontFamily: "monospace",
+                fontSize: `${fontSize}px`, lineHeight: `${lineHeight}px`,
+                border: "1px solid #ccc", borderRadius: "4px",
+                resize: "none", color: "transparent",
+                caretColor: "black", backgroundColor: "transparent", zIndex: 1,
+              }}
+            />
+            <div
+              ref={displayRef}
+              style={{
+                position: "absolute", top: 0, left: 0,
+                width: "100%", height: "250px",
+                padding: "8px", fontFamily: "monospace",
+                fontSize: `${fontSize}px`, lineHeight: `${lineHeight}px`,
+                border: "1px solid #ccc", borderRadius: "4px",
+                overflowY: "auto", whiteSpace: "pre-wrap",
+                wordBreak: "break-all", pointerEvents: "none", zIndex: 0,
+              }}
+            />
+          </div>
+        </div>
+      );
+    };
+
+    const MSAInput = ({ msa, setMsa, selectedSequence, setSelectedSequence }) => (
+      <div className="flex flex-col space-y-4">
+        <div className="w-full">
+          <ColoredTextEditor
+            value={msa}
+            onChange={setMsa}
+            selectedSequence={selectedSequence}
+            setSelectedSequence={setSelectedSequence}
+          />
+        </div>
+      </div>
+    );
+
+    const getSymmetricWeight = (weights, i, j, L, A) => {
+      const fromL = Math.floor(i / A), toL = Math.floor(j / A);
+      return fromL === toL ? 0 : weights[fromL < toL ? i * L * A + j : j * L * A + i];
+    };
+
+    const getColor = (value, min = -2, max = 2) => {
+      const normalizedValue =
+        Math.max(min, Math.min(max, value)) / Math.max(Math.abs(min), Math.abs(max));
+      let red, green, blue;
+      if (normalizedValue < 0) {
+        red = 255;
+        green = blue = Math.round(255 * (1 + normalizedValue));
+      } else if (normalizedValue > 0) {
+        blue = 255;
+        red = green = Math.round(255 * (1 - normalizedValue));
+      } else {
+        red = green = blue = 255;
+      }
+      return `rgb(${red}, ${green}, ${blue})`;
+    };
+
+    const getSoftmaxColor = (value) => {
+      const intensity = Math.round(255 * (1 - value));
+      return `rgb(${intensity}, ${intensity}, ${intensity})`;
+    };
+
+    const padSequences = (sequences) => {
+      const maxLength = Math.max(...sequences.map((seq) => seq.length || 1));
+      return sequences.map((seq) => {
+        if (seq.length === 0) return "0".repeat(maxLength);
+        return seq.length < maxLength ? seq + "0".repeat(maxLength - seq.length) : seq;
+      });
+    };
+
+    const adamOptimizer = (params, grads, state, hyperparams) => {
+      const { learningRate, beta1, beta2, epsilon } = hyperparams;
+      const { m, v, t } = state;
+      const tNext = t + 1;
+
+      const nextParams = params.map((param, i) => {
+        const grad = grads[i];
+        const mNext = beta1 * m[i] + (1 - beta1) * grad;
+        const vNext = beta2 * v[i] + (1 - beta2) * grad * grad;
+        const mHat = mNext / (1 - Math.pow(beta1, tNext));
+        const vHat = vNext / (1 - Math.pow(beta2, tNext));
+        return param - (learningRate * mHat) / (Math.sqrt(vHat) + epsilon);
+      });
+
+      const nextM = m.map((mi, i) => beta1 * mi + (1 - beta1) * grads[i]);
+      const nextV = v.map((vi, i) => beta2 * vi + (1 - beta2) * grads[i] * grads[i]);
+
+      return { params: nextParams, state: { m: nextM, v: nextV, t: tNext } };
+    };
+
+    const NetworkVisualization = ({ msa, modelOutputs, weightsRef, biasRef, L, A, selectedSequence }) => {
+      const weights = weightsRef.current;
+      const bias = biasRef.current;
+      const paddedSequences = padSequences(msa.split("\n"));
+      const xLoc = 100;
+      const xLocOffset = 100;
+      const labelHeight = 30;
+      const nodeSpacing = Math.min(20, 300 / (L * A));
+      const svgHeight = L * (nodeSpacing * A + 20) + labelHeight;
+
+      const isWeightActive = (fromIdx, toIdx) => {
+        const fromValue = Number(paddedSequences[selectedSequence][Math.floor(fromIdx / A)]);
+        const toValue = Number(paddedSequences[selectedSequence][Math.floor(toIdx / A)]);
+        return fromValue === fromIdx % A && toValue === toIdx % A;
+      };
+
+      const sortedWeightLines = Array(L).fill(null).flatMap((_, i) =>
+        Array(L).fill(null).flatMap((_, j) =>
+          i !== j
+            ? Array(A).fill(null).flatMap((_, a) =>
+                Array(A).fill(null).map((_, b) => {
+                  const fromIdx = i * A + a;
+                  const toIdx = j * A + b;
+                  const weight = getSymmetricWeight(weights, fromIdx, toIdx, L, A);
+                  const isActive = isWeightActive(fromIdx, toIdx);
+                  return {
+                    key: `weight-${i}-${a}-${j}-${b}`,
+                    x1: xLoc + nodeSpacing * 0.5,
+                    y1: i * (nodeSpacing * A + 20) + a * nodeSpacing + nodeSpacing / 2,
+                    x2: xLoc + xLocOffset - nodeSpacing * 0.5,
+                    y2: j * (nodeSpacing * A + 20) + b * nodeSpacing + nodeSpacing / 2,
+                    weight, isActive,
+                  };
+                })
+              )
+            : []
+        )
+      ).sort((a, b) => a.weight - b.weight);
+
+      const x = modelOutputs.oneHot;
+      const logits = modelOutputs.preSoftmax;
+      const logits_nobias = logits.map((value, i) => value - bias[i]);
+      const x_ = modelOutputs.postSoftmax;
+
+      const softmax = (arr) => {
+        const expValues = arr.map(Math.exp);
+        const sumExp = expValues.reduce((a, b) => a + b, 0);
+        return expValues.map((v) => v / sumExp);
+      };
+
+      const softmax_logits_nobias = Array(L).fill(null).flatMap((_, i) =>
+        softmax(logits_nobias.slice(i * A, (i + 1) * A))
+      );
+      const softmax_bias = Array(L).fill(null).flatMap((_, i) =>
+        softmax(bias.slice(i * A, (i + 1) * A))
+      );
+
+      const getBlueColor = (value) => {
+        const intensity = Math.round(255 * (1 - value));
+        return `rgb(${intensity}, ${intensity}, 255)`;
+      };
+      const getRedColor = (value) => {
+        const intensity = Math.round(255 * (1 - value));
+        return `rgb(255, ${intensity}, ${intensity})`;
+      };
+
+      return (
+        <svg width="300" height={svgHeight} style={{ backgroundColor: "white", display: "block", marginBottom: "1rem" }}>
+          <text x={xLoc} y={labelHeight / 1.5} fontSize="16" fontWeight="bold" textAnchor="middle">x</text>
+          <text x={(xLoc + xLoc + xLocOffset) / 2} y={labelHeight / 1.5} fontSize="16" fontWeight="bold" fill="blue" textAnchor="middle">w</text>
+          <text x={xLoc + xLocOffset + nodeSpacing * 0.5} y={labelHeight / 1.5} fontSize="16" fontWeight="bold" fill="red" textAnchor="middle">b</text>
+          <text x={xLoc + xLocOffset + nodeSpacing * 2} y={labelHeight / 1.5} fontSize="16" fontWeight="bold" textAnchor="middle">x'</text>
+          <g transform={`translate(0, ${labelHeight})`}>
+            {paddedSequences[selectedSequence].split("").map((value, i) =>
+              Array(A).fill(null).map((_, j) => (
+                <line
+                  key={`onehot-line-${i}-${j}`}
+                  x1={60} y1={i * (nodeSpacing * A + 20) + (nodeSpacing * A) / 2}
+                  x2={xLoc} y2={i * (nodeSpacing * A + 20) + j * nodeSpacing + nodeSpacing / 2}
+                  stroke={j === Number(value) ? "rgba(0,0,0,0.5)" : "rgba(200,200,200,0.5)"}
+                  strokeWidth={3}
+                />
+              ))
+            )}
+            {paddedSequences[selectedSequence].split("").map((value, i) => (
+              <rect
+                key={`input-${i}`}
+                x={30} y={i * (nodeSpacing * A + 20) + (nodeSpacing * A) / 2 - 15}
+                width={30} height={30}
+                fill={colorMap[Number(value)]} stroke="black" strokeWidth={3}
+              />
+            ))}
+            {paddedSequences[selectedSequence].split("").map((value, i) => (
+              <text key={`label-${i}`} x={5} y={i * (nodeSpacing * A + 20) + (nodeSpacing * A) / 2 + 6} fontSize="16" textAnchor="center">
+                {i}
+              </text>
+            ))}
+            {sortedWeightLines.map((line) => (
+              <line
+                key={line.key}
+                x1={line.x1} y1={line.y1} x2={line.x2} y2={line.y2}
+                stroke={getColor(line.weight)}
+                strokeWidth={Math.min(Math.abs(line.weight), 1.0) * 5}
+                opacity={Math.min(Math.abs(line.weight), 1.0)}
+              />
+            ))}
+            {x.map((value, i) => (
+              <circle
+                key={`onehot-${i}`}
+                cx={xLoc}
+                cy={Math.floor(i / A) * (nodeSpacing * A + 20) + (i % A) * nodeSpacing + nodeSpacing / 2}
+                r={nodeSpacing / 2}
+                fill={value === 1 ? "black" : "white"} stroke="black" strokeWidth={2}
+              />
+            ))}
+            {Array(L).fill(null).map((_, i) => (
+              <rect
+                key={`softmax-group-${i}`}
+                x={xLoc + xLocOffset} y={i * (nodeSpacing * A + 20)}
+                width={nodeSpacing * 2} height={nodeSpacing * A}
+                fill="none" stroke="black" strokeWidth={2}
+              />
+            ))}
+            {softmax_bias.map((value, i) => (
+              <circle
+                key={`softmax-bias-${i}`}
+                cx={xLoc + xLocOffset + nodeSpacing * 0.5}
+                cy={Math.floor(i / A) * (nodeSpacing * A + 20) + (i % A) * nodeSpacing + nodeSpacing / 2}
+                r={nodeSpacing / 2}
+                fill={getRedColor(value)} stroke="red" strokeWidth={2}
+              />
+            ))}
+            {softmax_logits_nobias.map((value, i) => (
+              <circle
+                key={`softmax-logits-nobias-${i}`}
+                cx={xLoc + xLocOffset}
+                cy={Math.floor(i / A) * (nodeSpacing * A + 20) + (i % A) * nodeSpacing + nodeSpacing / 2}
+                r={nodeSpacing / 2}
+                fill={getBlueColor(value)} stroke="blue" strokeWidth={2}
+              />
+            ))}
+            {x_.map((value, i) => (
+              <circle
+                key={`post-softmax-${i}`}
+                cx={xLoc + xLocOffset + nodeSpacing * 2}
+                cy={Math.floor(i / A) * (nodeSpacing * A + 20) + (i % A) * nodeSpacing + nodeSpacing / 2}
+                r={nodeSpacing / 2}
+                fill={getSoftmaxColor(value)} stroke="black" strokeWidth={2}
+              />
+            ))}
+          </g>
+        </svg>
+      );
+    };
+
+    const Heatmap = ({ data, size, cellSize, title, isWeightsHeatmap, L, A }) => {
+      const effectiveCellSize = isWeightsHeatmap ? cellSize * A : cellSize;
+      return (
+        <div className="flex flex-col items-center">
+          <h3 className="text-lg font-semibold mb-2">{title}</h3>
+          <svg width={size + 40} height={size + 40} style={{ backgroundColor: "white", display: "block", marginBottom: "1rem" }}>
+            <g transform="translate(35, 5)">
+              {data.map((row, i) =>
+                row.map((value, j) => (
+                  <rect
+                    key={`heatmap-${i}-${j}`}
+                    x={j * cellSize} y={i * cellSize}
+                    width={cellSize} height={cellSize}
+                    fill={getColor(value)} stroke="white" strokeWidth="1"
+                  />
+                ))
+              )}
+              {isWeightsHeatmap &&
+                Array(L).fill(null).map((_, i) =>
+                  Array(L).fill(null).map((_, j) => (
+                    <rect
+                      key={`group-${i}-${j}`}
+                      x={j * A * cellSize} y={i * A * cellSize}
+                      width={A * cellSize} height={A * cellSize}
+                      fill="none" stroke="black" strokeWidth="2"
+                    />
+                  ))
+                )}
+              {!isWeightsHeatmap && (
+                <rect x={0} y={0} width={size} height={size} fill="none" stroke="black" strokeWidth="2" />
+              )}
+              {Array(L).fill(null).map((_, i) => (
+                <React.Fragment key={`tick-${i}`}>
+                  <line x1={i * effectiveCellSize} y1={size} x2={i * effectiveCellSize} y2={size + 5} stroke="black" strokeWidth="1" />
+                  <text x={(i + 0.5) * effectiveCellSize} y={size + 20} textAnchor="middle" fontSize="15">{i}</text>
+                  <line x1={-5} y1={i * effectiveCellSize} x2={0} y2={i * effectiveCellSize} stroke="black" strokeWidth="1" />
+                  <text x={-10} y={(i + 0.5) * effectiveCellSize} textAnchor="end" dominantBaseline="middle" fontSize="15">{i}</text>
+                </React.Fragment>
+              ))}
+            </g>
+          </svg>
+        </div>
+      );
+    };
+
+    const Controls = ({
+      isOptimizing, setIsOptimizing, resetWeights,
+      l2WeightPenalty, setL2WeightPenalty,
+      l2BiasPenalty, setL2BiasPenalty,
+      learningRate, setLearningRate,
+    }) => (
+      <div className="flex flex-col space-y-4">
+        <div className="flex space-x-4">
+          <button
+            onClick={() => setIsOptimizing(!isOptimizing)}
+            className={`px-4 py-2 rounded-md text-white font-semibold ${
+              isOptimizing ? "bg-red-500 hover:bg-red-600" : "bg-blue-500 hover:bg-blue-600"
+            }`}
+          >
+            {isOptimizing ? "Stop" : "Start"} Optimization
+          </button>
+          <button
+            onClick={resetWeights}
+            className="px-4 py-2 bg-gray-500 text-white rounded-md hover:bg-gray-600 font-semibold"
+          >
+            Reset
+          </button>
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              <span style={{ color: "green" }}>&alpha;</span>: {l2WeightPenalty.toFixed(2)}
+            </label>
+            <input type="range" min="0.0" max="0.5" step="0.01" value={l2WeightPenalty}
+              onChange={(e) => setL2WeightPenalty(Number(e.target.value))} className="w-full" />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              <span style={{ color: "green" }}>&beta;</span>: {l2BiasPenalty.toFixed(2)}
+            </label>
+            <input type="range" min="0.0" max="0.5" step="0.01" value={l2BiasPenalty}
+              onChange={(e) => setL2BiasPenalty(Number(e.target.value))} className="w-full" />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              lr: {learningRate.toFixed(3)}
+            </label>
+            <input type="range" min="0.01" max="0.1" step="0.01" value={learningRate}
+              onChange={(e) => setLearningRate(Number(e.target.value))} className="w-full" />
+          </div>
+        </div>
+      </div>
+    );
+
+    const GREMLIN = () => {
+      const [L, setL] = useState(3);
+      const [A, setA] = useState(21);
+      const [weights, setWeights] = useState(() => Array(3 * 21 * 3 * 21).fill(0));
+      const [bias, setBias] = useState(() => Array(3 * 21).fill(0));
+      const [msa, setMsa] = useState("012\n102\n012\n102");
+      const [modelOutputs, setModelOutputs] = useState({ oneHot: [], preSoftmax: [], postSoftmax: [] });
+      const [loss, setLoss] = useState([]);
+      const [isOptimizing, setIsOptimizing] = useState(false);
+      const [l2WeightPenalty, setL2WeightPenalty] = useState(0.1);
+      const [l2BiasPenalty, setL2BiasPenalty] = useState(0.01);
+      const [learningRate, setLearningRate] = useState(0.1);
+      const [selectedSequence, setSelectedSequence] = useState(0);
+      const weightsRef = useRef(weights);
+      const biasRef = useRef(bias);
+      const weightsAdamState = useRef(null);
+      const biasAdamState = useRef(null);
+
+      const initializeAdamState = (size) => ({ m: Array(size).fill(0), v: Array(size).fill(0), t: 0 });
+
+      const calculateModelOutputs = useCallback((weights, bias, sample) => {
+        const x = sample.flatMap((s) => Array(A).fill(0).map((_, i) => (i === s ? 1 : 0)));
+        const logits = Array(L * A).fill(0).map((_, i) => {
+          const weightedSum = x.reduce(
+            (sum, val, j) =>
+              sum + (Math.floor(i / A) !== Math.floor(j / A) ? val * getSymmetricWeight(weights, i, j, L, A) : 0),
+            0
+          );
+          return weightedSum + bias[i];
+        });
+        const softmax = (arr) => {
+          const expValues = arr.map(Math.exp);
+          const sumExp = expValues.reduce((a, b) => a + b, 0);
+          return expValues.map((v) => v / sumExp);
+        };
+        const x_ = Array(L).fill(null).flatMap((_, i) => softmax(logits.slice(i * A, (i + 1) * A)));
+        return { oneHot: x, preSoftmax: logits, postSoftmax: x_ };
+      }, [A, L]);
+
+      const optimizeStep = useCallback(() => {
+        const paddedSequences = padSequences(msa.split("\n")).map((row) => row.split("").map(Number));
+        const currentWeights = [...weightsRef.current];
+        const currentBias = [...biasRef.current];
+        let totalLoss = 0;
+
+        if (!weightsAdamState.current) weightsAdamState.current = initializeAdamState(currentWeights.length);
+        if (!biasAdamState.current) biasAdamState.current = initializeAdamState(currentBias.length);
+
+        let weightGrads = Array(currentWeights.length).fill(0);
+        let biasGrads = Array(currentBias.length).fill(0);
+        const numSamples = paddedSequences.length;
+
+        paddedSequences.forEach((sample) => {
+          const { oneHot, postSoftmax } = calculateModelOutputs(currentWeights, currentBias, sample);
+          for (let i = 0; i < L * A; i++) {
+            for (let j = i + 1; j < L * A; j++) {
+              if (Math.floor(i / A) !== Math.floor(j / A)) {
+                const gradient = (postSoftmax[i] - oneHot[i]) * oneHot[j] + (postSoftmax[j] - oneHot[j]) * oneHot[i];
+                const weightIndex = i * L * A + j;
+                weightGrads[weightIndex] += gradient / numSamples;
+                weightGrads[j * L * A + i] += gradient / numSamples;
+              }
+            }
+            biasGrads[i] += (postSoftmax[i] - oneHot[i]) / numSamples;
+          }
+          const sampleLoss = -oneHot.reduce((sum, val, i) => sum + (val ? Math.log(postSoftmax[i]) : 0), 0);
+          totalLoss += sampleLoss / numSamples;
+        });
+
+        for (let i = 0; i < currentWeights.length; i++) weightGrads[i] += l2WeightPenalty * currentWeights[i];
+        for (let i = 0; i < currentBias.length; i++) biasGrads[i] += l2BiasPenalty * currentBias[i];
+
+        const adamHyperparams = { learningRate, beta1: 0.9, beta2: 0.999, epsilon: 1e-8 };
+        const { params: newWeights, state: newWeightsState } = adamOptimizer(currentWeights, weightGrads, weightsAdamState.current, adamHyperparams);
+        const { params: newBias, state: newBiasState } = adamOptimizer(currentBias, biasGrads, biasAdamState.current, adamHyperparams);
+
+        setWeights(newWeights);
+        setBias(newBias);
+        weightsRef.current = newWeights;
+        biasRef.current = newBias;
+        weightsAdamState.current = newWeightsState;
+        biasAdamState.current = newBiasState;
+
+        totalLoss += 0.5 * l2WeightPenalty * newWeights.reduce((sum, w) => sum + w * w, 0);
+        totalLoss += 0.5 * l2BiasPenalty * newBias.reduce((sum, b) => sum + b * b, 0);
+
+        setLoss((prev) => [...prev, { iteration: prev.length, value: totalLoss }]);
+        setModelOutputs(calculateModelOutputs(newWeights, newBias, paddedSequences[selectedSequence]));
+      }, [msa, calculateModelOutputs, l2WeightPenalty, l2BiasPenalty, learningRate, A, L, selectedSequence]);
+
+      const resetWeights = useCallback(() => {
+        const newWeights = Array(L * A * L * A).fill(0);
+        const newBias = Array(L * A).fill(0);
+        setWeights(newWeights);
+        setBias(newBias);
+        weightsRef.current = newWeights;
+        biasRef.current = newBias;
+        weightsAdamState.current = null;
+        biasAdamState.current = null;
+        const paddedSequences = padSequences(msa.split("\n"));
+        setModelOutputs(calculateModelOutputs(newWeights, newBias, paddedSequences[selectedSequence].split("").map(Number)));
+        setLoss([]);
+        setIsOptimizing(false);
+      }, [calculateModelOutputs, msa, L, A, selectedSequence]);
+
+      useEffect(() => {
+        let intervalId = null;
+        if (isOptimizing) intervalId = setInterval(optimizeStep, 100);
+        return () => { if (intervalId) clearInterval(intervalId); };
+      }, [isOptimizing, optimizeStep, L, A]);
+
+      useEffect(() => {
+        const processedMsa = msa.replace(/[^0-9\n]/g, "").split("\n").filter((line) => line.length > 0).join("\n");
+        const paddedSequences = padSequences(processedMsa.split("\n"));
+        const newL = paddedSequences[0].length;
+        const newA = Math.max(...paddedSequences.flatMap((line) => line.split("").map(Number))) + 1;
+        if (newL !== L || newA !== A) {
+          setL(newL);
+          setA(newA);
+          setIsOptimizing(false);
+          resetWeights();
+        } else {
+          setModelOutputs(calculateModelOutputs(weightsRef.current, biasRef.current, paddedSequences[selectedSequence].split("").map(Number)));
+        }
+      }, [msa, resetWeights, L, A, calculateModelOutputs, selectedSequence]);
+
+      useEffect(() => {
+        resetWeights();
+        setIsOptimizing(false);
+      }, [L, A]);
+
+      useEffect(() => {
+        const paddedSequences = padSequences(msa.split("\n"));
+        setModelOutputs(calculateModelOutputs(weightsRef.current, biasRef.current, paddedSequences[selectedSequence].split("").map(Number)));
+      }, [selectedSequence, msa, calculateModelOutputs]);
+
+      const calculateContactMap = useCallback(() => {
+        const l2Norms = Array(L).fill(null).map(() => Array(L).fill(0));
+        for (let i = 0; i < L; i++) {
+          for (let j = i + 1; j < L; j++) {
+            let norm = 0;
+            for (let a = 0; a < A; a++) {
+              for (let b = 0; b < A; b++) {
+                const weight = getSymmetricWeight(weightsRef.current, i * A + a, j * A + b, L, A);
+                norm += weight * weight;
+              }
+            }
+            l2Norms[i][j] = l2Norms[j][i] = Math.sqrt(norm);
+          }
+        }
+        const rowSums = l2Norms.map((row) => row.reduce((a, b) => a + b, 0));
+        const totalSum = rowSums.reduce((a, b) => a + b, 0);
+        return l2Norms.map((row, i) =>
+          row.map((value, j) => i === j ? 0 : value - (rowSums[i] * rowSums[j]) / (totalSum + 1e-8))
+        );
+      }, [A, L]);
+
+      return (
+        <div className="container mx-auto px-4 py-8 bg-gray-100">
+          <h1 className="text-3xl font-bold mb-6 text-center text-gray-800">GREMLIN Visualization</h1>
+
+          {/* Row 1: Controls + Loss Chart */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
+            <div className="flex flex-col gap-6">
+              <div className="bg-white rounded-lg shadow-md p-6">
+                <h2 className="text-xl font-semibold mb-4 text-gray-700">Optimization Controls</h2>
+                <Controls
+                  isOptimizing={isOptimizing} setIsOptimizing={setIsOptimizing}
+                  resetWeights={resetWeights}
+                  l2WeightPenalty={l2WeightPenalty} setL2WeightPenalty={setL2WeightPenalty}
+                  l2BiasPenalty={l2BiasPenalty} setL2BiasPenalty={setL2BiasPenalty}
+                  learningRate={learningRate} setLearningRate={setLearningRate}
+                  L={L} A={A}
+                />
+              </div>
+              <div className="bg-white rounded-lg shadow-md p-4" style={{ fontFamily: "monospace", fontSize: "14px", color: "#374151", lineHeight: "1.8" }}>
+                x' = softmax(x@<span style={{ color: "blue" }}>w</span>+<span style={{ color: "red" }}>b</span>)<br />
+                loss = -xlog(x') + <span style={{ color: "green" }}>&alpha;</span>L2(<span style={{ color: "blue" }}>w</span>) + <span style={{ color: "green" }}>&beta;</span>L2(<span style={{ color: "red" }}>b</span>)
+              </div>
+            </div>
+            <div className="bg-white rounded-lg shadow-md p-6">
+              <h2 className="text-xl font-semibold mb-4 text-gray-700">Loss Chart</h2>
+              <LossChart loss={loss} />
+            </div>
+          </div>
+
+          {/* Row 2: MSA + Model */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
+            <div className="bg-white rounded-lg shadow-md p-6">
+              <h2 className="text-xl font-semibold mb-4 text-gray-700">Multiple Sequence Alignment</h2>
+              <MSAInput msa={msa} setMsa={setMsa} selectedSequence={selectedSequence} setSelectedSequence={setSelectedSequence} />
+            </div>
+            <div className="bg-white rounded-lg shadow-md p-6">
+              <h2 className="text-xl font-semibold mb-4 text-gray-700">Model</h2>
+              <NetworkVisualization
+                msa={msa} modelOutputs={modelOutputs}
+                weightsRef={weightsRef} biasRef={biasRef}
+                L={L} A={A} selectedSequence={selectedSequence}
+              />
+            </div>
+          </div>
+
+          {/* Row 3: Weights + Contact Map */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <div className="bg-white rounded-lg shadow-md p-6">
+              <h2 className="text-xl font-semibold mb-4 text-gray-700">Weights</h2>
+              <div style={{ fontFamily: "monospace", fontSize: "13px", color: "#6b7280", marginBottom: "8px" }}>
+                <span style={{ color: "blue" }}>w</span>
+              </div>
+              <Heatmap
+                data={weightsRef.current.map((_, i) => weightsRef.current.slice(i * L * A, (i + 1) * L * A))}
+                size={300} cellSize={300 / (L * A)}
+                isWeightsHeatmap={true} L={L} A={A}
+              />
+            </div>
+            <div className="bg-white rounded-lg shadow-md p-6">
+              <h2 className="text-xl font-semibold mb-4 text-gray-700">Contact Map</h2>
+              <div style={{ fontFamily: "monospace", fontSize: "13px", color: "#6b7280", marginBottom: "8px" }}>
+                APC(L2norm(<span style={{ color: "blue" }}>w</span>))
+              </div>
+              <Heatmap
+                data={calculateContactMap()}
+                size={300} cellSize={300 / L}
+                isWeightsHeatmap={false} L={L} A={A}
+              />
+            </div>
+          </div>
+        </div>
+      );
+    };
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<GREMLIN />);
+  </script>
+</body>
+</html>
