@@ -61,12 +61,12 @@ if (missing.length) {
   failed++;
 }
 
-// The uniform struct must match what writeCfg packs: 12 x 4 bytes.
+// The uniform struct must match what writeCfg packs: 16 x 4 bytes.
 const cfgFields = (S.forward.match(/struct Cfg \{([\s\S]*?)\}/) || [, ''])[1]
   .split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('//'));
-console.log('\nCfg struct has ' + cfgFields.length + ' fields; writeCfg packs 48 bytes = 12 slots');
-if (cfgFields.length !== 12) {
-  console.log('  FAIL Cfg field count does not match the 48-byte packing in writeCfg');
+console.log('\nCfg struct has ' + cfgFields.length + ' fields; writeCfg packs 64 bytes = 16 slots');
+if (cfgFields.length !== 16) {
+  console.log('  FAIL Cfg field count does not match the 64-byte packing in writeCfg');
   failed++;
 }
 

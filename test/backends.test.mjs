@@ -131,11 +131,11 @@ await test('a wrong contact map is rejected', async () => {
   const fake = Object.create(Object.getPrototypeOf(wasm));
   Object.assign(fake, wasm);
   fake.x = Object.assign({}, wasm.x, {
-    contact_map: function (Wp, outp, scratchp, L, A) {
-      wasm.x.contact_map(Wp, outp, scratchp, L, A);
-      // transpose-with-offset: plausible-looking, wrong
+    contact_map: function (Wp, outp, scratchp, L, A, nA) {
+      wasm.x.contact_map(Wp, outp, scratchp, L, A, nA);   // full signature: the
+      // sabotage must be the offset below, not a dropped argument
       const v = new Float32Array(wasm.memory.buffer, outp, L * L);
-      for (let i = 0; i < L * L; i++) v[i] += 0.05;
+      for (let i = 0; i < L * L; i++) v[i] += 0.05;       // plausible, wrong
     }
   });
   const dev = await core.selfTest(fake);
@@ -299,7 +299,94 @@ await test('changing batch size mid-run does not reallocate WASM memory', async 
 });
 
 /* ------------------------------------------------------------------ */
-section('4. speed');
+section('4. reference conventions (sokrypton/laxy gremlin_jax.ipynb)');
+
+await test("regMode 'gremlin' matches the reference's 0.5*(L-1)*(A-1) penalty", () => {
+  // reference: l2 = 0.5*(L-1)*(A-1)*sum(w^2) + sum(b^2); loss = cce.sum() + lam*l2
+  // ours is that objective divided by Meff, so lam maps to alpha directly.
+  const L = 4, A = 3, N = 3, alpha = 0.1;
+  const seqs = Int32Array.from([0, 1, 2, 0, 1, 2, 0, 1, 0, 1, 2, 2]);
+  const g = new Gremlin({ L, A, N, seqs, uniformWeights: true, gap: -1, biasInit: 'zero',
+                          cfg: { batch: N, alpha, beta: 0, lr: 0, regMode: 'gremlin' } });
+  for (let i = 0; i < L; i++) for (let j = i + 1; j < L; j++)
+    for (let a = 0; a < A; a++) for (let b = 0; b < A; b++) {
+      g.W[((i * L + j) * A + b) * A + a] = 0.3;
+      g.W[((j * L + i) * A + a) * A + b] = 0.3;
+    }
+  g.step();
+  const sw2 = L * (L - 1) * A * A * 0.09;
+  const want = 0.5 * alpha * (L - 1) * (A - 1) / N * sw2;
+  assert.ok(Math.abs(g.regW - want) < 1e-4, 'regW ' + g.regW + ' != ' + want);
+});
+
+await test('the contact norm excludes the gap state, as the reference does', () => {
+  // reference: raw = sqrt(sum(square(W[:,:20,:,20]))) -- "note: we ignore gaps"
+  const L = 4, A = 21, N = 3;
+  const seqs = new Int32Array(L * N);
+  const g = new Gremlin({ L, A, N, seqs, uniformWeights: true, gap: 20, biasInit: 'zero',
+                          cfg: { batch: N, lr: 0 } });
+  assert.equal(g.normA, 20, 'normA should drop the gap state');
+  const before = g.contactMap();
+  // put a large coupling in the gap row/column only; scores must not move
+  for (let i = 0; i < L; i++) for (let j = 0; j < L; j++) {
+    if (i === j) continue;
+    for (let a = 0; a < A; a++) {
+      g.W[((i * L + j) * A + 20) * A + a] = 5.0;    // partner state = gap
+      g.W[((i * L + j) * A + a) * A + 20] = 5.0;    // own state = gap
+    }
+  }
+  const after = g.contactMap();
+  let maxd = 0;
+  for (let k = 0; k < before.length; k++) maxd = Math.max(maxd, Math.abs(before[k] - after[k]));
+  console.log('       score shift from gap-only couplings: ' + maxd.toExponential(2));
+  assert.ok(maxd < 1e-5, 'gap couplings leaked into the contact score: ' + maxd);
+});
+
+await test('bias init reproduces the reference formula', () => {
+  // b_ini = log(counts + 0.01*log(N)); b = b_ini - mean(b_ini)
+  const L = 3, A = 4, N = 5;
+  const seqs = Int32Array.from([0,1,2, 0,1,3, 0,2,2, 1,1,2, 0,1,2]);
+  const g = new Gremlin({ L, A, N, seqs, uniformWeights: true, gap: -1, biasInit: 'freq',
+                          cfg: { batch: N, lr: 0 } });
+  const pseudo = 0.01 * Math.log(N);
+  for (let i = 0; i < L; i++) {
+    const counts = new Array(A).fill(0);
+    for (let n = 0; n < N; n++) counts[seqs[n * L + i]]++;
+    const raw = counts.map(c => Math.log(c + pseudo));
+    const mean = raw.reduce((a, b) => a + b, 0) / A;
+    for (let a = 0; a < A; a++) {
+      assert.ok(Math.abs(g.b[i * A + a] - (raw[a] - mean)) < 1e-5,
+        'bias[' + i + ',' + a + '] = ' + g.b[i * A + a] + ' want ' + (raw[a] - mean));
+    }
+  }
+});
+
+await test("optMode 'gremlin' (scalar second moment) agrees between JS and WASM", async () => {
+  // GREMLIN_TF v2.1: vt is a scalar (sum(g*g)) per tensor, no bias correction
+  const sim = MSA.synthetic({ L: 18, N: 400, A: 20, nPairs: 3, seed: 77 });
+  const ds = MSA.buildDataset(sim.text, {});
+  const mk = (backend) => new Gremlin({
+    L: ds.L, A: ds.A, N: ds.N, seqs: ds.seqs, uniformWeights: true, backend,
+    gap: 20, biasInit: 'freq',
+    cfg: { batch: ds.N, lr: 1.0, alpha: 0.01, beta: 0.01, optMode: 'gremlin' }, seed: 5
+  });
+  const a = mk(null), b = mk(wasm);
+  for (let s = 0; s < 25; s++) { a.step(); b.step(); }
+  const lDev = Math.abs(a.loss - b.loss) / Math.abs(a.loss);
+  console.log('       after 25 steps: dLoss ' + lDev.toExponential(2)
+            + ', scalar vt ' + a.vt.toExponential(3));
+  assert.ok(lDev < 1e-3, 'JS and WASM disagree under optMode gremlin: ' + lDev);
+  assert.ok(a.vt > 0, 'scalar second moment never accumulated');
+  assert.ok(Number.isFinite(a.loss), 'non-finite loss');
+});
+
+await test('suggestLr follows 0.1*log(batch)/L', () => {
+  assert.ok(Math.abs(Gremlin.suggestLr(155, 128) - 0.1 * Math.log(128) / 155) < 1e-12);
+  assert.ok(Gremlin.suggestLr(155, 128) < Gremlin.suggestLr(48, 128), 'should shrink with L');
+});
+
+/* ------------------------------------------------------------------ */
+section('5. speed');
 
 await test('WASM is faster than JS', async () => {
   const A = 21;

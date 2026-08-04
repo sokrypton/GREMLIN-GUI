@@ -235,6 +235,52 @@ double adam(float *W, const float *G, float *M, float *V, int P,
 }
 
 /* ------------------------------------------------------------------ */
+/* GREMLIN_TF's modified Adam                                         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * GREMLIN_TF v2.1 replaces Adam's per-element second moment with a single
+ * scalar per tensor -- the running mean of the squared gradient *norm* -- and
+ * disables bias correction:
+ *
+ *   vt <- b2*vt + (1-b2)*sum(g*g)        (scalar)
+ *   x  <- x - lr/(sqrt(vt)+eps) * mt
+ *
+ * Every element shares one normalizer, so the update keeps the direction of the
+ * gradient and only its overall scale is standardized. Per-element Adam instead
+ * divides each component by its own |g|, which amplifies components whose
+ * gradient is near zero all the way to +-lr.
+ *
+ * Two passes are needed because the norm must be known before any element is
+ * updated: grad_norm2 reduces, adam_scaled applies.
+ */
+EXPORT("grad_norm2")
+double grad_norm2(const float *G, const float *W, int P, float gW) {
+  double s = 0.0;
+  for (int k = 0; k < P; k++) {
+    float g = G[k] + gW * W[k];
+    s += (double)g * (double)g;
+  }
+  return s;
+}
+
+EXPORT("adam_scaled")
+double adam_scaled(float *W, const float *G, float *M, int P,
+                   float lrEff, float b1, float gW) {
+  const float om1 = 1.0f - b1;
+  double sumsq = 0.0;
+  for (int k = 0; k < P; k++) {
+    float w = W[k];
+    sumsq += (double)w * (double)w;
+    float g = G[k] + gW * w;
+    float m = b1 * M[k] + om1 * g;
+    M[k] = m;
+    W[k] = w - lrEff * m;
+  }
+  return sumsq;
+}
+
+/* ------------------------------------------------------------------ */
 /* contact map                                                        */
 /* ------------------------------------------------------------------ */
 
@@ -244,33 +290,35 @@ double adam(float *W, const float *G, float *M, float *V, int P,
  * `scratch` must hold at least 2*A floats.
  */
 EXPORT("contact_map")
-void contact_map(const float *W, float *out, float *scratch, int L, int A) {
+void contact_map(const float *W, float *out, float *scratch, int L, int A, int nA) {
   const int AA = A * A;
   float *rowM = scratch;
   float *colM = scratch + A;
-  const float invA = 1.0f / (float)A;
-  const float invAA = 1.0f / (float)AA;
+  /* nA excludes the gap state: the reference takes the norm over the 20x20
+     amino-acid block only. Blocks are still strided by the full A. */
+  const float invA = 1.0f / (float)nA;
+  const float invAA = 1.0f / (float)(nA * nA);
 
   for (int i = 0; i < L; i++) out[i * L + i] = 0.0f;
 
   for (int i = 0; i < L; i++) {
     for (int j = i + 1; j < L; j++) {
       const float *blk = W + (i * L + j) * AA;
-      for (int a = 0; a < A; a++) { rowM[a] = 0.0f; colM[a] = 0.0f; }
+      for (int a = 0; a < nA; a++) { rowM[a] = 0.0f; colM[a] = 0.0f; }
       float all = 0.0f;
-      for (int bq = 0; bq < A; bq++) {
-        for (int a = 0; a < A; a++) {
+      for (int bq = 0; bq < nA; bq++) {
+        for (int a = 0; a < nA; a++) {
           float w = blk[bq * A + a];
           rowM[a] += w;                     /* sum over b, for state a at i */
           colM[bq] += w;                    /* sum over a, for state b at j */
           all += w;
         }
       }
-      for (int a = 0; a < A; a++) { rowM[a] *= invA; colM[a] *= invA; }
+      for (int a = 0; a < nA; a++) { rowM[a] *= invA; colM[a] *= invA; }
       all *= invAA;
       float s = 0.0f;
-      for (int bq = 0; bq < A; bq++) {
-        for (int a = 0; a < A; a++) {
+      for (int bq = 0; bq < nA; bq++) {
+        for (int a = 0; a < nA; a++) {
           float w = blk[bq * A + a] - rowM[a] - colM[bq] + all;
           s += w * w;
         }

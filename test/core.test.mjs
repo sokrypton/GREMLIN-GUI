@@ -43,7 +43,8 @@ test('data gradient, bias gradient and PLL match naiveGrads', () => {
 
   // uniform sequence weights so coef[n] === 1/N, matching the original's /numSamples
   const sw = new Float32Array(N).fill(1);
-  const g = new Gremlin({ L, A, N, seqs, sw, cfg: { batch: N, alpha: 0, beta: 0, lr: 0 } });
+  const g = new Gremlin({ L, A, N, seqs, sw, biasInit: 'zero',
+                          cfg: { batch: N, alpha: 0, beta: 0, lr: 0 } });
 
   // one random symmetric coupling tensor, written into both representations
   const Wnaive = Array(LA * LA).fill(0);
@@ -98,7 +99,9 @@ test('gradient still matches when the model must pad and A is large', () => {
     rows.push(row);
   }
   const sw = new Float32Array(N).fill(1);
-  const g = new Gremlin({ L, A, N, seqs, sw, cfg: { batch: N, alpha: 0, beta: 0, lr: 0 } });
+  // biasInit 'zero' because the oracle below is built with a zero bias
+  const g = new Gremlin({ L, A, N, seqs, sw, biasInit: 'zero',
+                          cfg: { batch: N, alpha: 0, beta: 0, lr: 0 } });
   const Wnaive = Array(LA * LA).fill(0);
   const bias = Array(LA).fill(0);
   for (let i = 0; i < L; i++) for (let j = i + 1; j < L; j++)
@@ -159,7 +162,8 @@ test('softmax survives couplings large enough to overflow the original', () => {
   const L = 3, A = 4, N = 2;
   const seqs = Int32Array.from([0, 1, 2, 1, 2, 3]);
   const sw = new Float32Array(N).fill(1);
-  const g = new Gremlin({ L, A, N, seqs, sw, cfg: { batch: N, alpha: 0, beta: 0, lr: 0 } });
+  const g = new Gremlin({ L, A, N, seqs, sw, biasInit: 'zero',
+                          cfg: { batch: N, alpha: 0, beta: 0, lr: 0 } });
   for (let i = 0; i < L; i++) for (let j = 0; j < L; j++) {
     if (i === j) continue;
     for (let a = 0; a < A; a++) for (let b = 0; b < A; b++) g.W[((i * L + j) * A + b) * A + a] = 500;
@@ -387,8 +391,10 @@ test("regMode 'gremlin' scales the penalty by (L-1)(A-1)/Meff", () => {
     g.step();
     return g.regW;
   };
+  // raw: lam = alpha/2.  gremlin: lam = 0.5*alpha*(L-1)*(A-1)/Meff, the 0.5
+  // matching the reference's 0.5*(L-1)*(A-1)*sum(w^2).  ratio = (L-1)(A-1)/Meff.
   const ratio = mk('gremlin') / mk('raw');
-  const want = ((L - 1) * (A - 1) / N) / 0.5;
+  const want = (L - 1) * (A - 1) / N;
   assert.ok(Math.abs(ratio - want) < 1e-3, 'ratio ' + ratio + ' != ' + want);
 });
 

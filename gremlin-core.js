@@ -254,13 +254,15 @@
      */
     this.cfg = {
       alpha: 0.01, beta: 0.01, lr: 0.05, batch: 256,
-      b1: 0.9, b2: 0.999, eps: 1e-8, regMode: 'gremlin'
+      b1: 0.9, b2: 0.999, eps: 1e-8, regMode: 'gremlin', optMode: 'adam'
     };
     if (opts.cfg) for (var k in opts.cfg) if (opts.cfg[k] !== undefined) this.cfg[k] = opts.cfg[k];
 
     this.rng = (opts.seed | 0) || 1234567;
     this.t = 0;
     this.steps = 0;
+    this.vt = 0;
+    this.vtb = 0;
     this.pll = 0;
     this.regW = 0;
     this.regB = 0;
@@ -285,8 +287,20 @@
       this.computeWeights(opts.identity === undefined ? 0.8 : opts.identity,
                           opts.maxRefs || 3000, opts.onProgress);
     }
+    /*
+     * Which states the contact norm covers. The reference takes the Frobenius
+     * norm over the 20x20 amino-acid block only -- "note: we ignore gaps" --
+     * because gap couplings carry alignment and phylogeny signal rather than
+     * structural contact. Our alphabet puts the gap last, so this is a prefix.
+     */
+    this.gap = opts.gap === undefined ? (this.A === 21 ? 20 : -1) : opts.gap;
+    this.normA = (this.gap === this.A - 1) ? this.A - 1 : this.A;
+
+    this.biasInit = opts.biasInit === undefined ? 'freq' : opts.biasInit;
+
     this._allocBatch();
     this.resetHistory();
+    if (this.biasInit === 'freq') this.initBias();
 
     /*
      * With WebGPU the parameters live on the device. The CPU arrays above become
@@ -306,6 +320,43 @@
       this.gpu.setup(this);
     }
   }
+
+  /*
+   * Start the bias at the single-site log frequencies rather than at zero, as
+   * the reference does:
+   *     b_ini = log(sum(X, 0) + 0.01*log(N));  b = b_ini - mean(b_ini, -1)
+   * The conditionals then begin already explaining the per-column composition,
+   * so the couplings do not have to spend early steps absorbing single-site
+   * signal. Counts are unweighted, matching the reference.
+   */
+  Gremlin.prototype.initBias = function () {
+    var L = this.L, A = this.A, N = this.N, seqs = this.seqs, b = this.b;
+    var pseudo = 0.01 * Math.log(Math.max(N, 2));
+    var counts = new Float64Array(L * A);
+    var n, i, a, off, mean;
+    for (n = 0; n < N; n++) {
+      off = n * L;
+      for (i = 0; i < L; i++) counts[i * A + seqs[off + i]] += 1;
+    }
+    for (i = 0; i < L; i++) {
+      mean = 0;
+      for (a = 0; a < A; a++) {
+        b[i * A + a] = Math.log(counts[i * A + a] + pseudo);
+        mean += b[i * A + a];
+      }
+      mean /= A;
+      for (a = 0; a < A; a++) b[i * A + a] -= mean;
+    }
+  };
+
+  /*
+   * The reference's learning-rate heuristic: 0.1 * log(batch) / L. It has to
+   * shrink with L because the pseudo-likelihood sums L conditionals per
+   * sequence. A fixed rate that works at L=48 overshoots badly at L=155.
+   */
+  Gremlin.suggestLr = function (L, B) {
+    return 0.1 * Math.log(Math.max(B, 2)) / Math.max(L, 1);
+  };
 
   // Bytes held by the parameter set: W + G + m + v. This, not FLOPs, is the
   // ceiling on L in a browser tab -- full-rank Potts is inherently O(L^2 A^2).
@@ -574,9 +625,63 @@
     var ibc2 = 1 / (1 - Math.pow(b2, this.t));
     var om1 = 1 - b1, om2 = 1 - b2;
 
+    /*
+     * The 0.5 matches the reference implementation (sokrypton/laxy
+     * examples/gremlin_jax.ipynb), which uses
+     *     l2 = 0.5*(L-1)*(A-1)*sum(w^2) + sum(b^2),  loss = cce.sum() + lam*l2
+     * with lam = 0.01. Its objective is the *sum* over sequences and ours is the
+     * Meff-normalized mean, so ours is exactly theirs divided by Meff -- same
+     * minimizer, and Adam is invariant to the constant. Without the 0.5 our
+     * coupling penalty was twice the reference's at the same alpha.
+     */
     var raw = cfg.regMode === 'raw';
-    var lamW = raw ? cfg.alpha / 2 : cfg.alpha * (this.L - 1) * (this.A - 1) / this.Meff;
+    var lamW = raw ? cfg.alpha / 2
+                   : 0.5 * cfg.alpha * (this.L - 1) * (this.A - 1) / this.Meff;
     var gW = 2 * lamW, sw2 = 0;
+    var lamB = raw ? cfg.beta / 2 : cfg.beta / this.Meff;
+    var gB = 2 * lamB, sb2 = 0;
+    var b = this.b, Gb = this.Gb, Mb = this.Mb, Vb = this.Vb, nb = b.length;
+
+    /*
+     * GREMLIN_TF's optimizer: one scalar second moment per tensor rather than
+     * one per element, and no bias correction. See grad_norm2 in gremlin.c.
+     */
+    if (cfg.optMode === 'gremlin') {
+      var n2, n2b;
+      if (this.wasm) {
+        n2 = this.wasm.x.grad_norm2(this.pG, this.pW, P, gW);
+        n2b = this.wasm.x.grad_norm2(this.pGb, this.pb, nb, gB);
+      } else {
+        n2 = 0;
+        for (k = 0; k < P; k++) { g = G[k] + gW * W[k]; n2 += g * g; }
+        n2b = 0;
+        for (k = 0; k < nb; k++) { g = Gb[k] + gB * b[k]; n2b += g * g; }
+      }
+      this.vt = b2 * (this.vt || 0) + om2 * n2;
+      this.vtb = b2 * (this.vtb || 0) + om2 * n2b;
+      var lrW = lr / (Math.sqrt(this.vt) + eps);
+      var lrB = lr / (Math.sqrt(this.vtb) + eps);
+
+      if (this.wasm) {
+        sw2 = this.wasm.x.adam_scaled(this.pW, this.pG, this.pM, P, lrW, b1, gW);
+        sb2 = this.wasm.x.adam_scaled(this.pb, this.pGb, this.pMb, nb, lrB, b1, gB);
+      } else {
+        for (k = 0; k < P; k++) {
+          w = W[k]; sw2 += w * w;
+          g = G[k] + gW * w;
+          m = b1 * M[k] + om1 * g; M[k] = m;
+          W[k] = w - lrW * m;
+        }
+        for (k = 0; k < nb; k++) {
+          w = b[k]; sb2 += w * w;
+          g = Gb[k] + gB * w;
+          m = b1 * Mb[k] + om1 * g; Mb[k] = m;
+          b[k] = w - lrB * m;
+        }
+      }
+      this._finishAdam(lamW, lamB, sw2, sb2);
+      return;
+    }
 
     if (this.wasm) {
       sw2 = this.wasm.x.adam(this.pW, this.pG, this.pM, this.pV, P,
@@ -592,9 +697,6 @@
       }
     }
 
-    var lamB = raw ? cfg.beta / 2 : cfg.beta / this.Meff;
-    var gB = 2 * lamB, sb2 = 0;
-    var b = this.b, Gb = this.Gb, Mb = this.Mb, Vb = this.Vb, nb = b.length;
     for (k = 0; k < nb; k++) {
       w = b[k];
       sb2 += w * w;
@@ -604,6 +706,11 @@
       b[k] = w - lr * (m * ibc1) / (Math.sqrt(v * ibc2) + eps);
     }
 
+    this._finishAdam(lamW, lamB, sw2, sb2);
+  };
+
+  /* Shared tail: report the penalty terms and record the loss point. */
+  Gremlin.prototype._finishAdam = function (lamW, lamB, sw2, sb2) {
     this.regW = lamW * sw2;
     this.regB = lamB * sb2;
     // sums are taken pre-update, so they pair with the pll from the same
@@ -679,7 +786,7 @@
     this.W.fill(0); this.G.fill(0); this.M.fill(0); this.V.fill(0);
     this.b.fill(0); this.Gb.fill(0); this.Mb.fill(0); this.Vb.fill(0);
     if (this.gpu) this.gpu.reset(this);
-    this.t = 0; this.steps = 0;
+    this.t = 0; this.steps = 0; this.vt = 0; this.vtb = 0;
     this.pll = 0; this.regW = 0; this.regB = 0; this.loss = 0; this.rms = 0;
     this.resetHistory();
   };
@@ -728,33 +835,34 @@
    * into. The original took the norm directly.
    */
   Gremlin.prototype.contactMap = function () {
-    var L = this.L, A = this.A, AA = this.AA, W = this.W;
+    var L = this.L, A = this.A, AA = this.AA, W = this.W, nA = this.normA;
     if (this.wasm) {
-      this.wasm.x.contact_map(this.pW, this.pCmOut, this.pScratch, L, A);
+      this.wasm.x.contact_map(this.pW, this.pCmOut, this.pScratch, L, A, nA);
       return this.cmOut.slice(0);           // detach from WASM memory for transfer
     }
     var F = new Float32Array(L * L);
     var rowM = new Float64Array(A), colM = new Float64Array(A);
     var i, j, a, bq, o, w, all, s, f;
+    var nAA = nA * nA;
 
     for (i = 0; i < L; i++) {
       for (j = i + 1; j < L; j++) {
         o = (i * L + j) * AA;
         rowM.fill(0); colM.fill(0); all = 0;
-        for (bq = 0; bq < A; bq++) {
-          for (a = 0; a < A; a++) {
+        // nA excludes the gap state; see this.normA
+        for (bq = 0; bq < nA; bq++) {
+          for (a = 0; a < nA; a++) {
             w = W[o + bq * A + a];
             rowM[a] += w;                       // sum over b, for state a at i
             colM[bq] += w;                      // sum over a, for state b at j
             all += w;
           }
         }
-        for (a = 0; a < A; a++) rowM[a] /= A;
-        for (bq = 0; bq < A; bq++) colM[bq] /= A;
-        all /= AA;
+        for (a = 0; a < nA; a++) { rowM[a] /= nA; colM[a] /= nA; }
+        all /= nAA;
         s = 0;
-        for (bq = 0; bq < A; bq++) {
-          for (a = 0; a < A; a++) {
+        for (bq = 0; bq < nA; bq++) {
+          for (a = 0; a < nA; a++) {
             w = W[o + bq * A + a] - rowM[a] - colM[bq] + all;
             s += w * w;
           }
@@ -1391,6 +1499,7 @@
           model = new Gremlin({
             L: d.L, A: d.A, N: d.N, seqs: d.seqs, cfg: d.cfg,
             uniformWeights: d.uniformWeights, backend: backend,
+            gap: d.gap, biasInit: d.biasInit,
             identity: d.identity, maxRefs: d.maxRefs, seed: d.seed,
             onProgress: function (f) { post({ type: 'progress', phase: 'weights', frac: f }); }
           });
@@ -1399,7 +1508,8 @@
             type: 'inited', L: model.L, A: model.A, N: model.N,
             Meff: model.Meff, approxWeights: model.approxWeights,
             params: model.P, bytes: model.bytes(),
-            backend: backendName
+            backend: backendName,
+            suggestLr: Gremlin.suggestLr(model.L, model.B)
           });
           await snapshot(true);
         } else if (m === 'data') {

@@ -44,8 +44,9 @@
   /* ------------------------------------------------------------------ */
 
   /*
-   * Uniforms shared by every kernel. `pad` keeps the struct at 32 bytes, which
-   * satisfies the 16-byte alignment rule with room to spare.
+   * Uniforms shared by every kernel, packed as 16 x 4 bytes by writeCfg. The
+   * trailing pads keep it a multiple of 16 for the alignment rule; `pad` itself
+   * doubles as the APC divisor, which only the apc shader reads.
    */
   var COMMON = `
 struct Cfg {
@@ -61,6 +62,10 @@ struct Cfg {
   b2 : f32,
   eps : f32,
   pad : f32,
+  nNorm : u32,
+  pad2 : u32,
+  pad3 : u32,
+  pad4 : u32,
 };
 @group(0) @binding(0) var<uniform> cfg : Cfg;
 `;
@@ -313,26 +318,28 @@ fn main(@builtin(workgroup_id) wid : vec3<u32>) {
     return;
   }
   let blk = (i * L + j) * AA;
+  // nNorm excludes the gap state; blocks are still strided by the full A
+  let nA = cfg.nNorm;
 
   var rowM : array<f32, ${MAX_A}>;
   var colM : array<f32, ${MAX_A}>;
-  for (var k : u32 = 0u; k < A; k = k + 1u) { rowM[k] = 0.0; colM[k] = 0.0; }
+  for (var k : u32 = 0u; k < nA; k = k + 1u) { rowM[k] = 0.0; colM[k] = 0.0; }
   var all : f32 = 0.0;
-  for (var b : u32 = 0u; b < A; b = b + 1u) {
-    for (var a : u32 = 0u; a < A; a = a + 1u) {
+  for (var b : u32 = 0u; b < nA; b = b + 1u) {
+    for (var a : u32 = 0u; a < nA; a = a + 1u) {
       let w = W[blk + b * A + a];
       rowM[a] = rowM[a] + w;
       colM[b] = colM[b] + w;
       all = all + w;
     }
   }
-  let invA = 1.0 / f32(A);
-  for (var k : u32 = 0u; k < A; k = k + 1u) { rowM[k] = rowM[k] * invA; colM[k] = colM[k] * invA; }
-  all = all / f32(AA);
+  let invA = 1.0 / f32(nA);
+  for (var k : u32 = 0u; k < nA; k = k + 1u) { rowM[k] = rowM[k] * invA; colM[k] = colM[k] * invA; }
+  all = all / f32(nA * nA);
 
   var s : f32 = 0.0;
-  for (var b : u32 = 0u; b < A; b = b + 1u) {
-    for (var a : u32 = 0u; a < A; a = a + 1u) {
+  for (var b : u32 = 0u; b < nA; b = b + 1u) {
+    for (var a : u32 = 0u; a < nA; a = a + 1u) {
       let w = W[blk + b * A + a] - rowM[a] - colM[b] + all;
       s = s + w * w;
     }
@@ -476,7 +483,7 @@ fn main(@builtin(workgroup_id) wid : vec3<u32>,
       seqs: mk(g.N * g.L), batch: mk(Bmax), coef: mk(Bmax),
       D: mk(Bmax * g.L * g.A), Loss: mk(Bmax * g.L),
       F: mk(g.L * g.L), rs: mk(g.L), out: mk(g.L * g.L),
-      cfg: d.createBuffer({ size: 48, usage: U.UNIFORM | U.COPY_DST })
+      cfg: d.createBuffer({ size: 64, usage: U.UNIFORM | U.COPY_DST })
     };
     this.read = d.createBuffer({ size: Math.max(g.L * g.L, P) * 4, usage: U.MAP_READ | U.COPY_DST });
     d.queue.writeBuffer(this.b.seqs, 0, g.seqs);
@@ -490,12 +497,13 @@ fn main(@builtin(workgroup_id) wid : vec3<u32>,
   };
 
   GpuBackend.prototype.writeCfg = function (g, extra) {
-    var a = new ArrayBuffer(48);
+    var a = new ArrayBuffer(64);
     var u = new Uint32Array(a), f = new Float32Array(a);
     u[0] = g.L; u[1] = g.A; u[2] = g.B; u[3] = extra.P >>> 0;
     f[4] = extra.lr || 0; f[5] = extra.gW || 0;
     f[6] = extra.ibc1 || 0; f[7] = extra.ibc2 || 0;
     f[8] = g.cfg.b1; f[9] = g.cfg.b2; f[10] = g.cfg.eps; f[11] = extra.pad || 0;
+    u[12] = g.normA >>> 0;
     this.device.queue.writeBuffer(this.b.cfg, 0, a);
   };
 

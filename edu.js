@@ -411,7 +411,9 @@
       send({
         type: 'init', L: ds.L, A: ds.A, N: ds.N, seqs: copy,
         cfg: S.cfg, maxRate: RATE, uniformWeights: true, seed: 1234567,
-        wantCoup: false, wantTop: true
+        wantCoup: false, wantTop: true,
+        // digit mode has no gap state, and the original started the bias at zero
+        gap: -1, biasInit: 'zero'
       }, [copy.buffer]);
     } else {
       send({ type: 'data', N: ds.N, seqs: copy, uniformWeights: true }, [copy.buffer]);

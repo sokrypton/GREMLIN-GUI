@@ -34,9 +34,13 @@ numerics are testable without a browser:
 
 ```sh
 node test/core.test.mjs        # numerics, MSA parsing, cost model  (26 tests)
-node test/backends.test.mjs    # WASM + the self-test gate          (16 tests)
+node test/backends.test.mjs    # WASM + the self-test gate          (21 tests)
 node test/wgsl.test.mjs        # WGSL validation (needs naga; skips if absent)
+node test/eval-precision.mjs   # contact precision vs an AlphaFold structure
 ```
+
+`eval-precision.mjs` is how the reference-alignment choices below were decided;
+it needs two AFDB files it does not ship and prints how to fetch them.
 
 `core.test.mjs` checks the gradient against the *original* implementation
 (`test/naive.mjs`, kept verbatim as an oracle), the invariants, and end-to-end
@@ -77,7 +81,7 @@ with `w_n = 1/|{m : identity(n,m) ≥ 0.8}|` and `Meff = Σ w_n`.
 
 Two regularization conventions, because the two pages want different things:
 
-- **practical** (`regMode: 'gremlin'`) — `λ_w = α(L−1)(A−1)`, `λ_b = β`. The
+- **practical** (`regMode: 'gremlin'`) — `λ_w = 0.5·α(L−1)(A−1)`, `λ_b = β`. The
   `(L−1)(A−1)` factor is what lets one α setting behave the same at L=8 and
   L=256; a bare constant is only ever tuned for one size.
 - **educational** (`regMode: 'raw'`) — `λ_w = α/2`, no L or Meff scaling, and no
@@ -85,7 +89,78 @@ Two regularization conventions, because the two pages want different things:
   the α/β/lr sliders still mean what they used to.
 
 Minibatching samples sequences with probability `w_n/Meff`, which makes the cost
-per step independent of N. N = 100k costs the same as N = 256.
+per step independent of N. N = 100k costs the same as N = 256. It also makes the
+objective batch-invariant for free: the reference has to scale `lam` by `B/N`
+when it minibatches because its data term is a sum, whereas ours is already a
+per-sequence mean.
+
+## Agreement with the reference implementation
+
+Checked against [`sokrypton/laxy`
+`examples/gremlin_jax.ipynb`](https://github.com/sokrypton/laxy/blob/main/examples/gremlin_jax.ipynb)
+and GREMLIN_TF v2.1. Its objective is the *sum* over sequences and ours is the
+Meff-normalized mean, so ours is exactly theirs divided by Meff — same minimizer,
+and Adam is invariant to the constant.
+
+Four things were wrong here and are now fixed. To decide rather than guess, each
+was scored against the AlphaFold model for the demo protein (`P0A7Y4`, RNase H,
+155 residues, 372 true contacts at CB < 8Å and |i−j| ≥ 5), 400 steps at B=128:
+
+| | top L/5 | top L/2 | top L |
+| --- | --- | --- | --- |
+| before | 77.4% | 76.6% | 67.1% |
+| **reference-aligned** | **83.9%** | **80.5%** | **69.0%** |
+| ablate: gaps back in the norm | 83.9% | 76.6% | 67.1% |
+| ablate: bias starts at zero | 80.6% | 79.2% | 66.5% |
+| ablate: old fixed lr 0.05 | 77.4% | 79.2% | 65.8% |
+| ablate: 2× coupling penalty | 80.6% | 76.6% | 69.0% |
+
+- **Gap state excluded from the contact norm.** The reference takes the
+  Frobenius norm over the 20×20 amino-acid block — *"note: we ignore gaps"*.
+  Gap couplings carry alignment and phylogeny signal, not structural contact.
+- **Bias initialized from single-site log frequencies**, `log(counts +
+  0.01·log N)` centred per column, instead of zeros. The conditionals then start
+  out already explaining column composition.
+- **The coupling penalty carries a 0.5.** Ours was 2× the reference at the same
+  α.
+- **Learning rate `0.1·log(batch)/L`.** It has to shrink with L because the
+  pseudo-likelihood sums L conditionals per sequence; a rate tuned at L=48
+  overshoots at L=155. The practical page adopts this automatically until you
+  move the slider.
+
+One deliberate deviation: we zero-sum gauge-fix each block before taking the
+norm; the reference relies on L2 to pin the gauge implicitly. Measured, gauge
+fixing is worth a little, so it stays:
+
+| scoring | top L/5 | top L/2 | top L |
+| --- | --- | --- | --- |
+| reference: raw 20×20 norm | 83.9% | 79.2% | 68.4% |
+| **ours: 20×20 + zero-sum gauge** | **83.9%** | **80.5%** | **69.0%** |
+| 21×21 + gauge (gaps in) | 83.9% | 76.6% | 67.1% |
+
+### The GREMLIN_TF optimizer, tested and not adopted
+
+GREMLIN_TF v2.1 uses a modified Adam that replaces the per-element second moment
+with a single scalar per tensor — the running mean of the squared gradient
+*norm* — and disables bias correction, so every element shares one normalizer
+and the update keeps the gradient's direction. It is available here as
+`optMode: 'gremlin'`, but it is not the default, because on this benchmark plain
+per-element Adam is better at every step count and every learning rate tried:
+
+| optimizer | lr | top L/5 | top L/2 | top L |
+| --- | --- | --- | --- | --- |
+| **Adam (per-element)** | 0.0031 | **83.9%** | **80.5%** | **69.0%** |
+| GREMLIN_TF (scalar vt) | 1.0 | 80.6% | 72.7% | 68.4% |
+| GREMLIN_TF (scalar vt) | 2.0 | 80.6% | 75.3% | 67.7% |
+
+The obvious explanation — that a scalar normalizer suffers from minibatch noise
+in ‖g‖² — turned out to be wrong: repeating at B=1024 kept the same ordering
+(Adam 71.0% top-L against 66.5%). It was designed as a full-batch L-BFGS
+replacement, and that is where its advantage presumably lies.
+
+Larger batches do help slightly per step (71.0% at B=1024/150 steps versus 69.0%
+at B=128/400 steps) but not per second: at equal wall clock, B=128 for 400 steps
+beats B=1024 for 50 steps, 69.0% against 63.9%.
 
 ## Backends
 

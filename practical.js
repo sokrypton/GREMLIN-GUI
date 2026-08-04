@@ -189,6 +189,8 @@
     return sp.int ? Math.round(v) : v;
   }
 
+  var sliderEls = {};
+
   (function buildSliders() {
     var box = $('sliders');
     SLIDERS.forEach(function (sp) {
@@ -203,8 +205,10 @@
       rng.addEventListener('input', function () {
         S.cfg[sp.key] = sVal(sp, Number(rng.value));
         val.textContent = sp.fmt(S.cfg[sp.key]);
+        if (sp.key === 'lr') S.lrTouched = true;   // stop auto-setting it
         send({ type: 'config', cfg: S.cfg, maxRate: S.maxRate });
       });
+      sliderEls[sp.key] = { rng: rng, val: val, sp: sp };
       box.append(wrap);
     });
   })();
@@ -544,6 +548,18 @@
       } else if (d.type === 'inited') {
         S.info = d;
         S.status = 'ready';
+        /*
+         * Adopt the reference's learning-rate heuristic, 0.1*log(batch)/L. It has
+         * to shrink with L because the pseudo-likelihood sums L conditionals per
+         * sequence; a rate tuned at L=48 overshoots badly at L=155. Only until
+         * the user moves the slider themselves.
+         */
+        if (!S.lrTouched && d.suggestLr > 0) {
+          S.cfg.lr = d.suggestLr;
+          var el = sliderEls.lr;
+          if (el) { el.rng.value = sPos(el.sp, S.cfg.lr); el.val.textContent = el.sp.fmt(S.cfg.lr); }
+          send({ type: 'config', cfg: S.cfg, maxRate: S.maxRate });
+        }
       } else if (d.type === 'snapshot') {
         S.snap = UI.mergeSnap(S.snap, d);
         S.running = d.running;
@@ -597,7 +613,8 @@
     send({
       type: 'init', L: ds.L, A: ds.A, N: ds.N, seqs: copy,
       cfg: S.cfg, maxRate: S.maxRate, identity: 0.8, maxRefs: 3000, seed: 1234567,
-      wantCoup: false, wantTop: false
+      wantCoup: false, wantTop: false,
+      gap: ds.gap, biasInit: 'freq'
     }, [copy.buffer]);
   }
 
