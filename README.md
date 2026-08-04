@@ -71,6 +71,42 @@ stripped; coverage is the non-gap fraction of a row; identity is measured
 against the query; `-`, `.`, ` ` and `X` all count as gaps. Defaults are
 coverage ≥ 0.75 and identity ≥ 0.15, sorted by identity with the query first.
 
+### Sequence reweighting (Meff)
+
+`w_n = 1/|{m : identity(n,m) ≥ 0.8}|`, `Meff = Σ w_n`. Count how many sequences
+are near-duplicates of each sequence, and give each one that fraction of a vote.
+It is O(N²L), and on a real alignment it is the entire startup cost.
+
+The tempting move is to approximate it. The better one is to make it fast: the
+comparison is byte equality, so `i8x16.eq` + `bitmask` + `popcount` does sixteen
+positions in three instructions with no per-pair JS call. On the demo alignment
+(15,688 × 155, threshold 0.8):
+
+| | Meff | time |
+| --- | --- | --- |
+| exact, WASM SIMD | 5,910 | **1.6 s** |
+| exact, scalar JS | 5,910 | 34.1 s |
+| greedy clustering (JS) | 6,834 | 8.4 s |
+| random reference subset, R=3000 | 8,029 | 11.4 s |
+
+The SIMD pass is *exact* — bit-identical weights to the scalar loop, verified
+across `L mod 16 ∈ {15, 0, 1, 15, 1, 12, 11}` where the padding is discounted —
+and still 5× faster than the approximation it replaces. So the default does not
+approximate at all when WASM is available, and whole-page load for `P0A7Y4` went
+from ~13 s to **4.2 s**.
+
+Clustering survives only as the no-WASM fallback, where the choice is 8.4 s
+against 34.1 s. It is worth being clear that it is *a different definition*, not
+a cheaper way to evaluate the same one: it forces a hard partition where the true
+neighbourhoods overlap, so it can only over-count, and it reads 16% high here
+(93% high on a synthetic set built to make neighbourhoods chain). The random
+reference subset is gone — it was slower, more biased, and seed-dependent.
+
+Contact precision is the same under all of them (80.6 / 79.2 / 68.4 at top L/5,
+L/2, L), which is the honest summary: Meff is not sensitive enough here for the
+approximation to matter. It just should not have been slower and biased for no
+reason.
+
 ### Redundancy filter (max pairwise identity)
 
 Optional greedy clustering: walk the sequences in order, keep one as a
@@ -84,19 +120,33 @@ takes tens of seconds on a large alignment.
 down-weights near-duplicates, so this trades data for a smaller N rather than for
 accuracy. On the demo alignment (400 steps, B=128):
 
-| max identity | N | Meff | filter cost | top L/5 | top L/2 | top L |
+| max identity | N | Meff | prep (parse+filter+reweight) | top L/5 | top L/2 | top L |
 | --- | --- | --- | --- | --- | --- | --- |
-| off | 15,688 | 8,099 | — | 83.9% | 80.5% | 69.0% |
-| 0.99 | 15,435 | 8,033 | +6s | 80.6% | 77.9% | 67.7% |
-| 0.95 | 14,604 | 7,952 | +11s | 83.9% | 79.2% | 70.3% |
-| 0.90 | 12,528 | 7,542 | +12s | 80.6% | 79.2% | 67.1% |
-| 0.80 | 6,834 | 6,834 | +9s | 83.9% | 80.5% | 69.0% |
+| off | 15,688 | 5,910 | 2.3s | 80.6% | 79.2% | 68.4% |
+| 0.99 | 15,435 | 5,913 | 4.9s | 80.6% | 79.2% | 67.7% |
+| 0.95 | 14,604 | 5,934 | 11.4s | 80.6% | 77.9% | 69.0% |
+| 0.90 | 12,528 | 5,993 | 15.1s | 80.6% | 79.2% | 68.4% |
+| 0.80 | 6,834 | 6,834 | 10.8s | 80.6% | 79.2% | 68.4% |
 
+Throwing away 20% of the alignment at 0.90 moves Meff from 5,910 to 5,993 — the
+reweighting had already discounted exactly those sequences to near nothing.
 Every row is within noise of the unfiltered baseline. The 0.80 row is the tell:
 Meff comes out exactly equal to N, because filtering at threshold *T* makes
 reweighting at *T* a no-op — the two mechanisms are doing the same job. Use the
 filter when you want a smaller N (memory, parse time, exporting a non-redundant
 set), not when you want better contacts.
+
+That equality is not a coincidence, and the code now relies on it. The filter and
+cluster-mode reweighting compute the *same* greedy partition and differ only in
+what they do with it — the filter keeps one member per cluster and drops the
+rest, reweighting keeps everyone at `1/|cluster|` — so both give
+`Meff = #clusters`. And after filtering at *T*, every surviving pair is provably
+below *T*, so a reweighting pass at any threshold ≥ *T* would return `Meff = N`
+without finding anything. It is skipped outright rather than run: exact, not an
+approximation. The skip deliberately does **not** fire below the filter
+threshold, where pairs in [*T_reweight*, *T_filter*) still count — so the default
+pairing of filter 0.9 with reweighting 0.8 still does the full work (Meff 5,993
+at N 12,528, against 5,910 unfiltered).
 
 #### Composition prefiltering: tried, measured, removed
 
@@ -116,6 +166,10 @@ after `L − need + 1` mismatches — 16 of them at id 0.90, about five 32-bit w
 comparisons — while the bound needs up to 21 integer mins. A one-operation
 variant, `matches ≤ L − |gaps₁ − gaps₂|` (also exact), is cheap enough but prunes
 only 6%, and was likewise a wash.
+
+The same experiment against the Meff pass came out the same way: at threshold
+0.8 the bound prunes 21.8% and costs 0.70×. Vectorizing the comparison, rather
+than avoiding it, is what actually paid.
 
 If this ever needs to be faster, the answer is an inverted k-mer index over the
 representatives, CD-HIT style, rather than a tighter per-pair bound.
@@ -321,8 +375,9 @@ past 1.6 GB rather than crashing the tab. Packing the `i<j` half would halve it.
 defaults to B=128, which buys 91% of peak throughput while giving the contact map
 three times as many frames to evolve through.
 
-Real example: `P0A7Y4` (L=155, 15,688 sequences after filtering, Meff≈8,100,
-10.6M parameters, 162 MB) runs ~2 steps/s and settles in roughly two minutes.
+Real example: `P0A7Y4` (L=155, 15,688 sequences after filtering, Meff = 5,910,
+10.6M parameters, 162 MB) is ready 4.2 s after the file lands, runs ~2 steps/s
+and settles in roughly two minutes.
 
 **Rendering had to stop being DOM.** Element counts the original emitted:
 
@@ -347,11 +402,10 @@ What is left:
 - **WebGPU**, once someone runs it on real hardware. The step is two
   matmul-shaped passes, ~29 GFLOP at L=128/N=1000, i.e. tens of milliseconds on
   an integrated GPU.
-- **Sequence reweighting** is O(N²L) and still ~10 s for 15k sequences even after
-  byte-packing the comparison. It is approximated above 3000 references, and that
-  approximation is biased upward — Meff reads 8,099 at 3000 references versus
-  11,406 at 500, because 1/count is convex. This is embarrassingly parallel and
-  would suit either a worker pool or the GPU.
+- **The redundancy filter** is still scalar JS — it is the one remaining place
+  that spends double-digit seconds on a large alignment (+6s at 0.9). It is the
+  same byte comparison `meff_counts` vectorizes, so the same treatment applies;
+  it has not had it because the filter is off by default.
 - **Packing the `i<j` half of W** would halve the memory ceiling, taking L=384
   from 992MB to about 520MB.
 

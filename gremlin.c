@@ -22,6 +22,8 @@
  * f32.sqrt instruction via __builtin_sqrtf.
  */
 
+#include <wasm_simd128.h>
+
 #define EXPORT(name) __attribute__((export_name(name)))
 
 typedef unsigned int u32;
@@ -278,6 +280,62 @@ double adam_scaled(float *W, const float *G, float *M, int P,
     W[k] = w - lrEff * m;
   }
   return sumsq;
+}
+
+/* ------------------------------------------------------------------ */
+/* Meff neighbour counts                                              */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The exact definition: cnt[n] = |{m : identity(n,m) >= threshold}|, from
+ * which w_n = 1/cnt[n] and Meff = sum w_n. It is O(N^2 L) and it is the whole
+ * startup cost on a real alignment -- 28s in JS on a 15688 x 155 MSA, which is
+ * why the JS path approximates above maxRefs.
+ *
+ * There is nothing to approximate if the exact count is cheap enough, and it
+ * can be: the comparison is a byte equality test, so i8x16_eq plus bitmask
+ * plus popcount does sixteen positions in three instructions. Rows are stored
+ * 16-byte aligned (stride = (L + 15) & ~15) with the padding zeroed, so the
+ * loads never straddle a row and the padding always matches -- the tail is
+ * corrected once, outside the loop, rather than branched around inside it.
+ *
+ * The early exit survives: once the mismatches make `need` unreachable the
+ * pair cannot count, so bail. It is tested per 16-byte block instead of per
+ * 4 bytes, which is a coarser bail but a far cheaper loop.
+ *
+ * Runs over rows [nFrom, nTo) so JS can slice the pass and report progress;
+ * every slice accumulates into the same cnt array, and because the inner loop
+ * starts at n+1 and bumps both counters, slicing by rows still visits each
+ * unordered pair exactly once.
+ */
+EXPORT("meff_counts")
+void meff_counts(const unsigned char *seq, float *cnt, int N, int stride,
+                 int L, int need, int nFrom, int nTo) {
+  const int blocks = (L + 15) >> 4;          // 16-byte blocks covering L
+
+  for (int n = nFrom; n < nTo; n++) {
+    const unsigned char *a = seq + (unsigned long)n * stride;
+    for (int m = n + 1; m < N; m++) {
+      const unsigned char *b = seq + (unsigned long)m * stride;
+      int raw = 0, k = 0;
+      for (int q = 0; q < blocks; q++, k += 16) {
+        v128_t e = wasm_i8x16_eq(wasm_v128_load(a + k), wasm_v128_load(b + k));
+        raw += __builtin_popcount((unsigned)wasm_i8x16_bitmask(e));
+        /*
+         * `raw` counts the zero padding too, and padding always matches, so the
+         * finished real count is raw - (blocks*16 - L). The best still
+         * reachable after this block is that plus every remaining byte:
+         * raw + (blocks*16 - k - 16) - (blocks*16 - L) = raw + L - k - 16.
+         * On the last block the term is exactly the finished count, so this one
+         * test serves as both the early exit and the acceptance test -- falling
+         * out of the loop already means the pair qualifies.
+         */
+        if (raw + (L - k - 16) < need) goto next;
+      }
+      cnt[n] += 1.0f; cnt[m] += 1.0f;
+      next:;
+    }
+  }
 }
 
 /* ------------------------------------------------------------------ */

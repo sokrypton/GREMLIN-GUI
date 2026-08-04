@@ -298,6 +298,67 @@ await test('changing batch size mid-run does not reallocate WASM memory', async 
   console.log('       batch 64 -> 512 with no reallocation, loss ' + g.loss.toFixed(4));
 });
 
+await test('the SIMD Meff count is exact, not an approximation', async () => {
+  /*
+   * meff_counts must reproduce the scalar neighbour count bit for bit, or the
+   * "no approximation needed" claim is empty. L is swept across the 16-byte
+   * block boundary because that is where the zero padding is discounted, and
+   * an off-by-one there would silently shift every weight.
+   */
+  for (const L of [15, 16, 17, 31, 33, 60, 155]) {
+    let s = 99 + L;
+    const rnd = () => (s = (s * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+    const AB = 'ACDEFGHIKLMNPQRSTVWY';
+    const rows = [];
+    for (let f = 0; f < 10; f++) {              // 10 founders, 25 mutants each,
+      const base = [];                          // so identities straddle 0.8
+      for (let k = 0; k < L; k++) base.push(AB[(rnd() * 20) | 0]);
+      for (let c = 0; c < 25; c++) {
+        const v = base.slice();
+        const nm = 1 + ((rnd() * (L / 3)) | 0);
+        for (let m = 0; m < nm; m++) v[(rnd() * L) | 0] = AB[(rnd() * 20) | 0];
+        rows.push('>f' + f + '_' + c + '\n' + v.join(''));
+      }
+    }
+    const ds = MSA.buildDataset(rows.join('\n') + '\n', {});
+    const mk = (backend) => new Gremlin({
+      L: ds.L, A: ds.A, N: ds.N, seqs: ds.seqs, backend,
+      identity: 0.8, weightMode: 'exact', seed: 1, cfg: { batch: 64 }
+    });
+    const js = mk(null), sd = mk(wasm);
+    let maxd = 0;
+    for (let n = 0; n < ds.N; n++) maxd = Math.max(maxd, Math.abs(js.sw[n] - sd.sw[n]));
+    assert.equal(maxd, 0,
+      'L=' + L + ' (' + (L % 16) + ' past a 16-byte block): weights differ by ' + maxd);
+    assert.ok(js.Meff > 10 && js.Meff < ds.N,
+      'L=' + L + ': fixture has no reweighting to check (Meff ' + js.Meff + '/' + ds.N + ')');
+  }
+  console.log('       L = 15,16,17,31,33,60,155: weights bit-identical to the scalar count');
+});
+
+await test('WASM makes the exact count the default, no approximation', async () => {
+  const sim = MSA.synthetic({ L: 64, N: 4000, A: 20, nPairs: 4, seed: 11 });
+  const ds = MSA.buildDataset(sim.text, {});
+  const mk = (backend) => {
+    const t0 = performance.now();
+    // maxRefs below N, so the JS path would approximate
+    const g = new Gremlin({
+      L: ds.L, A: ds.A, N: ds.N, seqs: ds.seqs, backend,
+      identity: 0.8, maxRefs: 1000, seed: 1, cfg: { batch: 64 }
+    });
+    return { g, ms: performance.now() - t0 };
+  };
+  const w = mk(wasm), j = mk(null);
+  console.log('       N=' + ds.N + ' L=' + ds.L + ': wasm -> ' + w.g.weightMode
+            + ' ' + w.ms.toFixed(0) + 'ms,  js -> ' + j.g.weightMode + ' ' + j.ms.toFixed(0) + 'ms');
+  assert.equal(w.g.weightMode, 'exact', 'wasm should not need to approximate');
+  assert.equal(w.g.approxWeights, false);
+  assert.equal(j.g.weightMode, 'cluster', 'the JS fallback should still approximate above maxRefs');
+  // the fallback is a different definition, so it may only over-count
+  assert.ok(j.g.Meff >= w.g.Meff - 1e-3,
+    'cluster Meff ' + j.g.Meff + ' below exact ' + w.g.Meff);
+});
+
 /* ------------------------------------------------------------------ */
 section('4. reference conventions (sokrypton/laxy gremlin_jax.ipynb)');
 

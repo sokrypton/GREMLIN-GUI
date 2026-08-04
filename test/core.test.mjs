@@ -469,6 +469,107 @@ test('no pair above the threshold survives the filter', () => {
   assert.ok(worst < need, 'a pair above the threshold survived: ' + worst + ' >= ' + need);
 });
 
+/*
+ * An alignment with redundancy you can count: `founders` unrelated sequences,
+ * each copied `perFounder` times with `mut` positions randomized. The synthetic
+ * generator makes sequences that are all mutually distant, which leaves the
+ * clustering tests vacuous (400 sequences, 400 clusters).
+ */
+function clustered({ founders, perFounder, L, mut, seed }) {
+  let s = seed >>> 0;
+  const rnd = () => (s = (s * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+  const AB = 'ACDEFGHIKLMNPQRSTVWY';
+  const rows = [];
+  for (let f = 0; f < founders; f++) {
+    const base = [];
+    for (let k = 0; k < L; k++) base.push(AB[(rnd() * AB.length) | 0]);
+    for (let c = 0; c < perFounder; c++) {
+      const v = base.slice();
+      for (let m = 0; m < mut; m++) v[(rnd() * L) | 0] = AB[(rnd() * AB.length) | 0];
+      rows.push('>f' + f + '_' + c + '\n' + v.join(''));
+    }
+  }
+  return rows.join('\n') + '\n';
+}
+
+test('cluster weights and the filter compute the same partition', () => {
+  // Meff under cluster weighting is the number of clusters, and the filter
+  // keeps exactly one sequence per cluster -- so the two must agree on the
+  // count even though one discards data and the other does not.
+  const text = clustered({ founders: 12, perFounder: 20, L: 60, mut: 3, seed: 21 });
+  const full = MSA.buildDataset(text, {});
+  const filtered = MSA.buildDataset(text, { maxIdentity: 0.8 });
+  assert.ok(filtered.N < full.N / 2, 'the fixture is not actually redundant');
+
+  const g = new Gremlin({
+    L: full.L, A: full.A, N: full.N, seqs: full.seqs,
+    identity: 0.8, weightMode: 'cluster', seed: 1
+  });
+  assert.equal(g.weightMode, 'cluster');
+  assert.equal(g.clusters, filtered.N,
+    'cluster count ' + g.clusters + ' != kept sequences ' + filtered.N);
+  // Meff = sum of 1/|cluster| = number of clusters, up to float32 accumulation
+  assert.ok(Math.abs(g.Meff - g.clusters) < 0.01 * g.clusters,
+    'Meff ' + g.Meff.toFixed(2) + ' != cluster count ' + g.clusters);
+  console.log('       N ' + full.N + ' -> ' + g.clusters + ' clusters; '
+            + 'filter kept ' + filtered.N + ', cluster Meff ' + g.Meff.toFixed(1));
+});
+
+test('cluster weights approximate exact Meff from above', () => {
+  // Mutate hard enough that identities straddle the threshold, so the identity
+  // graph is NOT a disjoint union of cliques and the hard partition has to
+  // split neighbourhoods the exact count treats as overlapping. That is the
+  // case where the two disagree, and the direction of the disagreement is the
+  // thing worth pinning down.
+  const mk = (text, weightMode) => {
+    const ds = MSA.buildDataset(text, {});
+    return new Gremlin({
+      L: ds.L, A: ds.A, N: ds.N, seqs: ds.seqs, identity: 0.8, weightMode, seed: 1
+    });
+  };
+  let sawGap = false;
+  for (const mut of [8, 11, 14]) {
+    const text = clustered({ founders: 8, perFounder: 25, L: 60, mut, seed: 7 });
+    const exact = mk(text, 'exact'), cluster = mk(text, 'cluster');
+    console.log('       ' + mut + ' mutations: exact Meff ' + exact.Meff.toFixed(1)
+              + ', cluster Meff ' + cluster.Meff.toFixed(1)
+              + ' (' + cluster.clusters + ' clusters)');
+    assert.ok(cluster.Meff >= exact.Meff - 1e-3,
+      'cluster Meff ' + cluster.Meff + ' below exact ' + exact.Meff);
+    assert.ok(cluster.Meff < 3 * exact.Meff, 'cluster Meff wildly off');
+    assert.equal(exact.approxWeights, false);
+    assert.equal(cluster.approxWeights, true);
+    if (cluster.Meff > exact.Meff + 1e-3) sawGap = true;
+  }
+  assert.ok(sawGap, 'never hit a case where the partition and the pair count differ');
+});
+
+test('reweighting is skipped when the filter already ran at that threshold', () => {
+  const sim = MSA.synthetic({ L: 24, N: 300, A: 6, nPairs: 2, seed: 5 });
+  const ds = MSA.buildDataset(sim.text, { maxIdentity: 0.8 });
+  const mk = (opts) => new Gremlin(Object.assign({
+    L: ds.L, A: ds.A, N: ds.N, seqs: ds.seqs, identity: 0.8, seed: 1
+  }, opts));
+
+  // no pair survives above 0.8, so the O(N^2) pass provably returns Meff = N
+  const done = mk({ filteredAt: 0.8 });
+  assert.equal(done.weightMode, 'filtered');
+  assert.equal(done.Meff, ds.N);
+  assert.equal(done.approxWeights, false, 'the skip is exact, not an approximation');
+
+  // and the skip agrees with actually running it
+  const ran = mk({ weightMode: 'exact' });
+  assert.ok(Math.abs(ran.Meff - done.Meff) < 1e-3,
+    'skip claimed ' + done.Meff + ' but the exact pass found ' + ran.Meff);
+
+  // below the filter threshold the skip must NOT fire: pairs in [Tm, Tf) count
+  const lower = mk({ filteredAt: 0.8, identity: 0.5, weightMode: 'exact' });
+  assert.notEqual(lower.weightMode, 'filtered');
+  assert.ok(lower.Meff < ds.N, 'reweighting at 0.5 found no neighbours at all');
+  console.log('       filtered at 0.8: Meff ' + done.Meff + ' (skipped) == ' + ran.Meff.toFixed(1)
+            + ' (computed); at threshold 0.5 it still finds ' + lower.Meff.toFixed(1));
+});
+
 /* ------------------------------------------------------------------ */
 section('5. cost model');
 

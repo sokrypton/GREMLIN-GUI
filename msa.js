@@ -119,6 +119,25 @@
    * If this ever needs to be faster the answer is an inverted k-mer index over
    * the representatives (CD-HIT's approach), not a tighter per-pair bound.
    *
+   * The same measurement was repeated against the Meff pass, where the bound
+   * prunes less (21.8% at threshold 0.8) and costs more (0.70x). Same reason,
+   * same verdict.
+   *
+   * ---------------------------------------------------------------------------
+   * Relation to Meff reweighting
+   * ---------------------------------------------------------------------------
+   * This is the same clustering computeWeights does in its 'cluster' weight
+   * mode -- one greedy pass, each sequence compared against representatives
+   * only. The two differ purely in what they do with the partition:
+   *
+   *     this           keep one member per cluster, drop the rest      N -> #clusters
+   *     computeWeights keep every sequence at weight 1/|its cluster|   Meff = #clusters
+   *
+   * Both land on the same Meff, which is why filtering at a threshold makes
+   * reweighting at that same threshold a no-op -- see the `filteredAt` skip in
+   * computeWeights. Reweighting is the better default of the two, since it
+   * reaches the same Meff without discarding sequences.
+   *
    * Returns { keep: Int32Array, stats }.
    */
   function filterRedundancy(seqs, N, L, A, maxId, onProgress) {

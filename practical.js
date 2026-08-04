@@ -470,8 +470,17 @@
     }
     $('meffWarn').hidden = !(info && info.approxWeights);
     if (info && info.approxWeights) {
-      $('meffWarn').innerHTML = 'M<sub>eff</sub> is approximate: exact reweighting is O(N²L), so above '
-        + '3000 sequences neighbours are counted against a random reference subset and scaled.';
+      $('meffWarn').innerHTML = 'M<sub>eff</sub> is approximate. Exact reweighting counts, for every '
+        + 'sequence, how many others are ≥80% identical to it — O(N²L), and without the WASM backend '
+        + 'that is a ~30s stall here, so sequences are instead grouped greedily and weighted '
+        + '1/|group|. That reads high (it splits neighbourhoods that really overlap). With WASM the '
+        + 'exact count runs in about a second and is what you get.';
+    }
+    if (info && info.weightMode === 'filtered') {
+      $('meffWarn').hidden = false;
+      $('meffWarn').innerHTML = 'Reweighting was skipped, not approximated: the redundancy filter '
+        + 'already removed every pair above this threshold, so no sequence has a near neighbour '
+        + 'left to be down-weighted against and M<sub>eff</sub> = N exactly.';
     }
 
     // Gate on `info`, not `ds`: reweighting is O(N^2 L) and takes ~10s on a
