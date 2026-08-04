@@ -77,6 +77,90 @@
   var LOG_FLOOR = 1e-30;
 
   /* ------------------------------------------------------------------ */
+  /* WASM backend                                                       */
+  /* ------------------------------------------------------------------ */
+
+  /*
+   * gremlin.wasm holds the same kernels as the JS below, compiled with
+   * -msimd128. The parameters live in WASM linear memory and JS keeps
+   * Float32Array views over the same bytes, so everything that only *reads* the
+   * parameters -- topCouplings, couplingMatrix, block, the snapshot path --
+   * keeps working unchanged. Only the hot loops are replaced.
+   *
+   * Growing WASM memory detaches existing views, so the whole layout is sized
+   * and reserved up front and never grown again.
+   */
+  function WasmBackend(instance, memory) {
+    this.name = 'wasm';
+    this.x = instance.exports;
+    this.memory = memory;
+    this.ptr = this.x.heap_base();
+  }
+
+  WasmBackend.prototype.reserve = function (bytes) {
+    var need = this.ptr + bytes + 65536;
+    var have = this.memory.buffer.byteLength;
+    if (need > have) {
+      var pages = Math.ceil((need - have) / 65536);
+      this.memory.grow(pages);              // invalidates every existing view
+    }
+    this.base = this.memory.buffer;
+  };
+
+  /* Bump-allocate a view. Called only between reserve() and first use. */
+  WasmBackend.prototype.f32 = function (n) {
+    var p = this.ptr;
+    this.ptr += n * 4;
+    return { p: p, v: new Float32Array(this.base, p, n) };
+  };
+  WasmBackend.prototype.i32 = function (n) {
+    var p = this.ptr;
+    this.ptr += n * 4;
+    return { p: p, v: new Int32Array(this.base, p, n) };
+  };
+
+  /*
+   * Fetch and instantiate gremlin.wasm. Memory is imported rather than exported
+   * so JS controls growth. Returns null on any failure, which is a normal
+   * outcome -- the caller falls back to JS.
+   */
+  function initWasm(url) {
+    if (typeof WebAssembly === 'undefined') return Promise.resolve(null);
+    var memory;
+    try {
+      memory = new WebAssembly.Memory({ initial: 16 });
+    } catch (e) { return Promise.resolve(null); }
+
+    // Browser/worker: fetch. node (no `self`): read from disk, for the tests.
+    var inBrowser = typeof self !== 'undefined' && typeof fetch === 'function';
+    var get;
+    if (inBrowser) {
+      get = fetch(url).then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status + ' fetching ' + url);
+        return r.arrayBuffer();
+      });
+    } else if (typeof require === 'function') {
+      try {
+        get = Promise.resolve(require('fs').readFileSync(url));
+      } catch (e) { get = Promise.reject(e); }
+    } else {
+      API.lastWasmError = 'no way to load ' + url;
+      return Promise.resolve(null);
+    }
+
+    return get.then(function (buf) {
+      return WebAssembly.instantiate(buf, { env: { memory: memory } });
+    }).then(function (res) {
+      return new WasmBackend(res.instance, memory);
+    }).catch(function (e) {
+      // A failure here is normal (no WASM, blocked fetch); the caller falls back
+      // to JS. Record why, so it can be reported rather than guessed at.
+      API.lastWasmError = String(e && e.message || e);
+      return null;
+    });
+  }
+
+  /* ------------------------------------------------------------------ */
   /* Gremlin                                                            */
   /* ------------------------------------------------------------------ */
 
@@ -99,14 +183,64 @@
     this.P = this.L * this.L * this.AA;
     this.seqs = opts.seqs;
 
-    this.W = new Float32Array(this.P);
-    this.G = new Float32Array(this.P);
-    this.M = new Float32Array(this.P);
-    this.V = new Float32Array(this.P);
-    this.b = new Float32Array(this.L * this.A);
-    this.Gb = new Float32Array(this.L * this.A);
-    this.Mb = new Float32Array(this.L * this.A);
-    this.Vb = new Float32Array(this.L * this.A);
+    /*
+     * With a WASM backend the parameters must live in its linear memory. Size
+     * the whole layout first, reserve once, then bump-allocate -- growing later
+     * would detach every view.
+     */
+    var LA = this.L * this.A;
+    var bk = opts.backend || null;
+    var be = bk && bk.name === 'wasm' ? bk : null;
+    this.wasm = be;
+    this.gpu = bk && bk.name === 'webgpu' ? bk : null;
+
+    /*
+     * Batch buffers are allocated once at the largest batch the UI can request,
+     * so changing the batch size later never reallocates -- which matters
+     * because bump-allocating into WASM memory a second time would leak, and
+     * growing that memory would detach every view.
+     */
+    var Bmax = Math.min(Math.max(4096, (opts.cfg && opts.cfg.batch) | 0), this.N);
+    if (Bmax < 1) Bmax = 1;
+    this.Bmax = Bmax;
+
+    if (be) {
+      var scratchN = Math.max(2 * this.A, this.L);
+      var floats = 4 * this.P + 4 * LA + Bmax * this.A + scratchN
+                 + this.L * this.L + 2 * LA + Bmax;
+      var ints = this.N * this.L + Bmax;
+      be.reserve(floats * 4 + ints * 4);
+
+      var w = be.f32(this.P); this.W = w.v; this.pW = w.p;
+      var g = be.f32(this.P); this.G = g.v; this.pG = g.p;
+      var m = be.f32(this.P); this.M = m.v; this.pM = m.p;
+      var v = be.f32(this.P); this.V = v.v; this.pV = v.p;
+      var bb = be.f32(LA); this.b = bb.v; this.pb = bb.p;
+      var gb = be.f32(LA); this.Gb = gb.v; this.pGb = gb.p;
+      var mb = be.f32(LA); this.Mb = mb.v; this.pMb = mb.p;
+      var vb = be.f32(LA); this.Vb = vb.v; this.pVb = vb.p;
+      var sc = be.f32(scratchN); this.scratch = sc.v; this.pScratch = sc.p;
+      var co = be.f32(this.L * this.L); this.cmOut = co.v; this.pCmOut = co.p;
+      var lo = be.f32(LA); this.loBuf = lo.v; this.pLo = lo.p;
+      var pr = be.f32(LA); this.prBuf = pr.v; this.pPr = pr.p;
+      var sq = be.i32(this.N * this.L); this.seqs = sq.v; this.pSeqs = sq.p;
+      this.seqs.set(opts.seqs);
+      var li = be.f32(Bmax * this.A); this.Li = li.v; this.pLi = li.p;
+      var ba = be.i32(Bmax); this.batch = ba.v; this.pBatch = ba.p;
+      var cf = be.f32(Bmax); this.coef = cf.v; this.pCoef = cf.p;
+    } else {
+      this.W = new Float32Array(this.P);
+      this.G = new Float32Array(this.P);
+      this.M = new Float32Array(this.P);
+      this.V = new Float32Array(this.P);
+      this.b = new Float32Array(LA);
+      this.Gb = new Float32Array(LA);
+      this.Mb = new Float32Array(LA);
+      this.Vb = new Float32Array(LA);
+      this.Li = new Float32Array(Bmax * this.A);
+      this.batch = new Int32Array(Bmax);
+      this.coef = new Float32Array(Bmax);
+    }
 
     /*
      * regMode picks how alpha/beta become penalties:
@@ -153,6 +287,24 @@
     }
     this._allocBatch();
     this.resetHistory();
+
+    /*
+     * With WebGPU the parameters live on the device. The CPU arrays above become
+     * a shadow that syncW() refreshes, and only for models small enough that the
+     * readback is trivial -- above that the shadow is dropped entirely, because
+     * every consumer of it (the node diagram, the coupling matrix, the top-K
+     * scan) is illegible at that size and gated off anyway.
+     */
+    if (this.gpu) {
+      this.shadow = this.P <= this.gpu.SYNC_MAX;
+      if (!this.shadow) {
+        this.W = new Float32Array(0);
+        this.G = new Float32Array(0);
+        this.M = new Float32Array(0);
+        this.V = new Float32Array(0);
+      }
+      this.gpu.setup(this);
+    }
   }
 
   // Bytes held by the parameter set: W + G + m + v. This, not FLOPs, is the
@@ -276,13 +428,12 @@
 
   /* ---------------- batching ---------------------------------------- */
 
+  /* Only picks the working batch size and rebuilds the sampling table; the
+     buffers themselves were sized once, in the constructor. */
   Gremlin.prototype._allocBatch = function () {
-    var B = Math.min(this.cfg.batch | 0 || 1, this.N);
+    var B = Math.min(this.cfg.batch | 0 || 1, this.N, this.Bmax);
     if (B < 1) B = 1;
     this.B = B;
-    this.Li = new Float32Array(B * this.A);
-    this.batch = new Int32Array(B);
-    this.coef = new Float32Array(B);
     var cum = new Float32Array(this.N), acc = 0;
     for (var n = 0; n < this.N; n++) { acc += this.sw[n]; cum[n] = acc; }
     this.cum = cum;
@@ -320,6 +471,16 @@
     var Li = this.Li, batch = this.batch, coef = this.coef, seqs = this.seqs;
     var B = this._buildBatch();
     var i, j, n, a, k, r, o, bi, rowI, blk, xi, c, mx, s, iv, e, d;
+
+    if (this.wasm) {
+      this.pll = this.wasm.x.data_pass(
+        this.pW, this.pG, this.pb, this.pGb, this.pLi,
+        this.pSeqs, this.pBatch, this.pCoef, L, A, B);
+      this._symmetrize();
+      this._adam();
+      this.steps++;
+      return this.loss;
+    }
 
     G.fill(0); Gb.fill(0);
     var loss = 0;
@@ -386,6 +547,7 @@
   Gremlin.prototype._symmetrize = function () {
     var L = this.L, A = this.A, AA = this.AA, G = this.G;
     var i, j, a, bq, oIJ, oJI, s;
+    if (this.wasm) { this.wasm.x.symmetrize(this.pG, L, A); return; }
     for (i = 0; i < L; i++) {
       for (j = i + 1; j < L; j++) {
         oIJ = (i * L + j) * AA; oJI = (j * L + i) * AA;
@@ -416,13 +578,18 @@
     var lamW = raw ? cfg.alpha / 2 : cfg.alpha * (this.L - 1) * (this.A - 1) / this.Meff;
     var gW = 2 * lamW, sw2 = 0;
 
-    for (k = 0; k < P; k++) {
-      w = W[k];
-      sw2 += w * w;
-      g = G[k] + gW * w;
-      m = b1 * M[k] + om1 * g; M[k] = m;
-      v = b2 * V[k] + om2 * g * g; V[k] = v;
-      W[k] = w - lr * (m * ibc1) / (Math.sqrt(v * ibc2) + eps);
+    if (this.wasm) {
+      sw2 = this.wasm.x.adam(this.pW, this.pG, this.pM, this.pV, P,
+                             lr, b1, b2, eps, ibc1, ibc2, gW);
+    } else {
+      for (k = 0; k < P; k++) {
+        w = W[k];
+        sw2 += w * w;
+        g = G[k] + gW * w;
+        m = b1 * M[k] + om1 * g; M[k] = m;
+        v = b2 * V[k] + om2 * g * g; V[k] = v;
+        W[k] = w - lr * (m * ibc1) / (Math.sqrt(v * ibc2) + eps);
+      }
     }
 
     var lamB = raw ? cfg.beta / 2 : cfg.beta / this.Meff;
@@ -447,9 +614,71 @@
     this.recordHistory();
   };
 
+  /* ---------------- async surface (used by the worker) -------------- */
+
+  /*
+   * One uniform async API over all three backends, so the worker's loop does not
+   * branch on which one is active. JS and WASM resolve immediately; WebGPU
+   * encodes and submits without blocking, and the queue is drained by the
+   * periodic contactMapAsync() readback.
+   */
+  Gremlin.prototype.stepAsync = function () {
+    if (!this.gpu) return Promise.resolve(this.step());
+    var self = this;
+    var B = this._buildBatch();
+    var cfg = this.cfg;
+    this.t++;
+    var ibc1 = 1 / (1 - Math.pow(cfg.b1, this.t));
+    var ibc2 = 1 / (1 - Math.pow(cfg.b2, this.t));
+    var raw = cfg.regMode === 'raw';
+    var lamW = raw ? cfg.alpha / 2 : cfg.alpha * (this.L - 1) * (this.A - 1) / this.Meff;
+    var lamB = raw ? cfg.beta / 2 : cfg.beta / this.Meff;
+    this._lamW = lamW; this._lamB = lamB;
+    return this.gpu.step(this, {
+      lr: cfg.lr, ibc1: ibc1, ibc2: ibc2, gW: 2 * lamW, gWb: 2 * lamB
+    }).then(function () {
+      self.steps++;
+      return self.loss;
+    });
+  };
+
+  /* Refresh the reported loss breakdown. Costs three small readbacks, so the
+     worker only calls it when it is about to post a snapshot. */
+  Gremlin.prototype.syncStats = function () {
+    if (!this.gpu) return Promise.resolve();
+    var self = this;
+    return this.gpu.syncScalars(this).then(function (s) {
+      self.pll = s.pll;
+      self.regW = self._lamW * s.sw2;
+      self.regB = self._lamB * s.sb2;
+      self.loss = self.pll + self.regW + self.regB;
+      var live = self.L * (self.L - 1) * self.AA;
+      self.rms = live > 0 ? Math.sqrt(s.sw2 / live) : 0;
+      self.recordHistory();
+    });
+  };
+
+  Gremlin.prototype.contactMapAsync = function () {
+    if (!this.gpu) return Promise.resolve(this.contactMap());
+    return this.gpu.contactMap(this);
+  };
+
+  Gremlin.prototype.blockAsync = function (i, j) {
+    if (!this.gpu) return Promise.resolve(this.block(i, j));
+    return this.gpu.blockAt(this, i, j);
+  };
+
+  /* Make the CPU-side helpers usable. Resolves false when the model is too big
+     to shadow, in which case the caller must skip those panels. */
+  Gremlin.prototype.syncParams = function () {
+    if (!this.gpu) return Promise.resolve(true);
+    return this.gpu.syncW(this);
+  };
+
   Gremlin.prototype.reset = function () {
     this.W.fill(0); this.G.fill(0); this.M.fill(0); this.V.fill(0);
     this.b.fill(0); this.Gb.fill(0); this.Mb.fill(0); this.Vb.fill(0);
+    if (this.gpu) this.gpu.reset(this);
     this.t = 0; this.steps = 0;
     this.pll = 0; this.regW = 0; this.regB = 0; this.loss = 0; this.rms = 0;
     this.resetHistory();
@@ -500,6 +729,10 @@
    */
   Gremlin.prototype.contactMap = function () {
     var L = this.L, A = this.A, AA = this.AA, W = this.W;
+    if (this.wasm) {
+      this.wasm.x.contact_map(this.pW, this.pCmOut, this.pScratch, L, A);
+      return this.cmOut.slice(0);           // detach from WASM memory for transfer
+    }
     var F = new Float32Array(L * L);
     var rowM = new Float64Array(A), colM = new Float64Array(A);
     var i, j, a, bq, o, w, all, s, f;
@@ -702,8 +935,18 @@
    * L must be unchanged; N may differ.
    */
   Gremlin.prototype.setData = function (seqs, N, uniform, identity, maxRefs) {
-    this.seqs = seqs;
-    this.N = N | 0;
+    N = N | 0;
+    if (this.wasm) {
+      // The sequence buffer was sized once; a larger alignment needs a full
+      // re-init. Report that rather than writing past the reservation.
+      if (N * this.L > this.seqs.length) return false;
+      // Copy in place and keep the full-length view: nothing reads past N*L, and
+      // shrinking it would break a later, larger setData.
+      this.seqs.set(seqs.subarray ? seqs.subarray(0, N * this.L) : seqs);
+    } else {
+      this.seqs = seqs;
+    }
+    this.N = N;
     if (uniform) {
       this.sw = new Float32Array(this.N);
       this.sw.fill(1);
@@ -751,10 +994,211 @@
   /* worker plumbing                                                    */
   /* ------------------------------------------------------------------ */
 
-  var API = { Gremlin: Gremlin, softmaxRange: softmaxRange };
+  /* ------------------------------------------------------------------ */
+  /* backend selection                                                  */
+  /* ------------------------------------------------------------------ */
+
+  /*
+   * A candidate backend has to prove itself before it is used. Both backends
+   * run one step of the same small fixed problem and their gradients are
+   * compared against the plain-JS reference; a backend that disagrees refuses
+   * itself and the caller falls back.
+   *
+   * This is not ceremony. A miscompiled kernel or a wrong workgroup index would
+   * otherwise produce a plausible-looking contact map that is quietly wrong,
+   * which is the worst possible failure for this tool. The probe costs a few
+   * milliseconds at startup.
+   */
+  var SELFTEST_TOL = 2e-3;
+  // How much looser the parameter check is than the gradient check. See the
+  // comment in compareProbe: Adam is discontinuous where the gradient vanishes.
+  var W_TOL_RATIO = 25;
+
+  function buildProbe(backend) {
+    var L = 5, A = 4, N = 6, seed = 20260804;
+    var st = seed >>> 0;
+    var rnd = function () {
+      st ^= st << 13; st >>>= 0; st ^= st >>> 17; st ^= st << 5; st >>>= 0;
+      return st / 4294967296;
+    };
+    var seqs = new Int32Array(L * N), k;
+    for (k = 0; k < L * N; k++) seqs[k] = (rnd() * A) | 0;
+
+    var g = new Gremlin({
+      L: L, A: A, N: N, seqs: seqs, uniformWeights: true, backend: backend,
+      cfg: { batch: N, alpha: 0.05, beta: 0.02, lr: 0.03, regMode: 'gremlin' }
+    });
+    // a deterministic, non-symmetric-looking starting point
+    var i, j, a, bq, c;
+    st = 987654321;
+    for (i = 0; i < L; i++) {
+      for (j = i + 1; j < L; j++) {
+        for (a = 0; a < A; a++) {
+          for (bq = 0; bq < A; bq++) {
+            c = (rnd() - 0.5) * 1.5;
+            g.W[((i * L + j) * A + bq) * A + a] = c;
+            g.W[((j * L + i) * A + a) * A + bq] = c;
+          }
+        }
+      }
+    }
+    for (k = 0; k < L * A; k++) g.b[k] = (rnd() - 0.5) * 0.6;
+    return g;
+  }
+
+  /*
+   * Max relative deviation of a candidate backend from the JS reference.
+   * Async because the GPU path has to read its results back. The probe is
+   * deliberately tiny (L=5, A=4, N=6), so even a GPU round trip is milliseconds.
+   */
+  function selfTest(backend) {
+    var ref = buildProbe(null);
+    var cand = buildProbe(backend);
+    // identical starting parameters (buildProbe is deterministic, but be explicit)
+    if (cand.gpu) {
+      cand.gpu.device.queue.writeBuffer(cand.gpu.b.W, 0, ref.W);
+      cand.gpu.device.queue.writeBuffer(cand.gpu.b.bias, 0, ref.b);
+      cand.gpu.dirtyW = true;
+    } else {
+      cand.W.set(ref.W);
+      cand.b.set(ref.b);
+    }
+
+    ref.step();
+    return cand.stepAsync()
+      .then(function () { return cand.gpu ? cand.syncStats() : null; })
+      .then(function () { return cand.gpu ? cand.gpu.readback(cand.gpu.b.G, cand.P) : cand.G; })
+      .then(function (candG) {
+        return (cand.gpu ? cand.gpu.readback(cand.gpu.b.Gb, cand.b.length) : Promise.resolve(cand.Gb))
+          .then(function (candGb) {
+            return (cand.gpu ? cand.syncParams() : Promise.resolve(true))
+              .then(function () { return cand.contactMapAsync(); })
+              .then(function (cmB) { return compareProbe(ref, cand, candG, candGb, cmB); });
+          });
+      });
+  }
+
+  function compareProbe(ref, cand, candG, candGb, cmB) {
+    var worst = 0, k, d, scale;
+    for (k = 0; k < ref.P; k++) {
+      scale = Math.abs(ref.G[k]) + 1e-4;
+      d = Math.abs(ref.G[k] - candG[k]) / scale;
+      if (d > worst) worst = d;
+    }
+    for (k = 0; k < ref.b.length; k++) {
+      scale = Math.abs(ref.Gb[k]) + 1e-4;
+      d = Math.abs(ref.Gb[k] - candGb[k]) / scale;
+      if (d > worst) worst = d;
+    }
+    /*
+     * The updated parameters are checked too, but against a looser bound, and
+     * deliberately so. Adam's first step is lr * g / (|g| + eps), i.e. very
+     * nearly lr * sign(g) -- discontinuous at g = 0. Wherever the true gradient
+     * is near zero, a difference of 1e-6 between two correct implementations can
+     * flip the sign and move that parameter by a full lr. Holding W to the same
+     * tolerance as the gradient would reject correct backends. A genuinely wrong
+     * update is off by far more than this (the sabotage tests land at 19x).
+     */
+    var wWorst = 0;
+    if (cand.W.length === ref.P) {
+      for (k = 0; k < ref.P; k++) {
+        scale = Math.abs(ref.W[k]) + 1e-4;
+        d = Math.abs(ref.W[k] - cand.W[k]) / scale;
+        if (d > wWorst) wWorst = d;
+      }
+    }
+    if (wWorst / W_TOL_RATIO > worst) worst = wWorst / W_TOL_RATIO;
+    var lossDev = Math.abs(ref.pll - cand.pll) / (Math.abs(ref.pll) + 1e-6);
+    if (lossDev > worst) worst = lossDev;
+
+    // a contact map too, which exercises the gauge fixing and APC
+    var cmA = ref.contactMap();
+    for (k = 0; k < cmA.length; k++) {
+      scale = Math.abs(cmA[k]) + 1e-4;
+      d = Math.abs(cmA[k] - cmB[k]) / scale;
+      if (d > worst) worst = d;
+    }
+    return worst;
+  }
+
+  /*
+   * Pick the fastest backend that passes. Order is WebGPU, then WASM, then JS.
+   * JS is always available and is the reference, so selection cannot fail.
+   * Returns { backend, name, tried: [{name, ok, dev, err}] }.
+   */
+  function selectBackend(opts) {
+    opts = opts || {};
+    var tried = [];
+    var wasmUrl = opts.wasmUrl || 'gremlin.wasm';
+
+    function accept(be, name) {
+      var p;
+      try {
+        p = selfTest(be);
+      } catch (e) {
+        tried.push({ name: name, ok: false, err: String(e && e.message || e) });
+        return Promise.resolve(null);
+      }
+      return p.then(function (dev) {
+        var ok = dev <= SELFTEST_TOL;
+        tried.push({ name: name, ok: ok, dev: dev });
+        return ok ? be : null;
+      }).catch(function (e) {
+        tried.push({ name: name, ok: false, err: String(e && e.message || e) });
+        return null;
+      });
+    }
+
+    var chain = Promise.resolve(null);
+
+    if (opts.gpu !== false && typeof GremlinGPU !== 'undefined' && GremlinGPU.available()) {
+      chain = chain.then(function (got) {
+        if (got) return got;
+        return GremlinGPU.create().then(function (be) {
+          return be ? accept(be, 'webgpu') : (tried.push({ name: 'webgpu', ok: false, err: 'unavailable' }), null);
+        }).catch(function (e) {
+          tried.push({ name: 'webgpu', ok: false, err: String(e && e.message || e) });
+          return null;
+        });
+      });
+    } else {
+      tried.push({ name: 'webgpu', ok: false, err: 'not supported here' });
+    }
+
+    if (opts.wasm !== false) {
+      chain = chain.then(function (got) {
+        if (got) return got;
+        return initWasm(wasmUrl).then(function (be) {
+          return be ? accept(be, 'wasm') : (tried.push({ name: 'wasm', ok: false, err: 'load failed' }), null);
+        });
+      });
+    }
+
+    return chain.then(function (got) {
+      return { backend: got, name: got ? got.name : 'js', tried: tried };
+    });
+  }
+
+  var API = {
+    Gremlin: Gremlin,
+    softmaxRange: softmaxRange,
+    initWasm: initWasm,
+    selfTest: selfTest,
+    selectBackend: selectBackend,
+    SELFTEST_TOL: SELFTEST_TOL
+  };
 
   if (IS_WORKER) {
+    /*
+     * The GPU backend is optional and lives in its own file so this one stays
+     * loadable in node. A missing or broken gremlin-gpu.js just means no WebGPU.
+     */
+    try { self.importScripts('gremlin-gpu.js'); } catch (e) { /* no WebGPU path */ }
+
     var model = null;
+    var backend = null;
+    var backendName = 'js';
+    var backendTried = [];
     var running = false;
     var scheduled = false;
     var snapEveryMs = 100;      // cap UI updates at ~10 Hz regardless of step rate
@@ -781,8 +1225,23 @@
 
     function post(m, xfer) { self.postMessage(m, xfer || []); }
 
-    function snapshot(heavy) {
+    /*
+     * Async because WebGPU has to read the contact map back off the device.
+     * The JS and WASM backends resolve immediately.
+     */
+    async function snapshot(heavy) {
       if (!model) return;
+      if (model.gpu) await model.syncStats();
+
+      /*
+       * The per-sequence forward pass, the top-K scan and the dense matrix only
+       * feed panels that are illegible above a few hundred nodes, so they are
+       * skipped entirely for larger models. That also means a GPU-resident model
+       * never needs its parameters copied back for a snapshot -- only the L x L
+       * contact map crosses, which is 96KB at L=155 against 162MB for W.
+       */
+      var small = model.L * model.A <= 256;
+
       var msg = {
         type: 'snapshot',
         steps: model.steps,
@@ -798,15 +1257,21 @@
       };
       var xfer = [msg.hist.buffer];
 
-      msg.contact = model.contactMap();
+      msg.contact = await model.contactMapAsync();
       xfer.push(msg.contact.buffer);
+      msg.sel = model.sel;
 
-      var f = model.forward(model.sel);
-      msg.sel = f.sel;
-      msg.logits = f.logits; msg.probs = f.probs; msg.pBias = f.pBias; msg.pNoBias = f.pNoBias;
-      xfer.push(f.logits.buffer, f.probs.buffer, f.pBias.buffer, f.pNoBias.buffer);
+      /* Everything below reads the parameters directly, so a GPU-resident model
+         needs them synced first -- which syncParams only allows when small. */
+      var haveParams = small && (await model.syncParams());
 
-      if (heavy) {
+      if (haveParams) {
+        var f = model.forward(model.sel);
+        msg.logits = f.logits; msg.probs = f.probs; msg.pBias = f.pBias; msg.pNoBias = f.pNoBias;
+        xfer.push(f.logits.buffer, f.probs.buffer, f.pBias.buffer, f.pNoBias.buffer);
+      }
+
+      if (heavy && haveParams) {
         if (wantCoup) {
           var ci = model.couplingImage(512);
           msg.coupImg = ci.data; msg.coupN = ci.n; msg.coupScale = ci.scale;
@@ -817,11 +1282,8 @@
           msg.top = model.topCouplings(2000);
           xfer.push(msg.top.buffer);
         }
-        // small models also get the raw matrix, for the educational heat map
-        if (model.L * model.A <= 256) {
-          msg.wmat = model.couplingMatrix();
-          xfer.push(msg.wmat.buffer);
-        }
+        msg.wmat = model.couplingMatrix();      // the educational heat map
+        xfer.push(msg.wmat.buffer);
       }
       post(msg, xfer);
     }
@@ -843,37 +1305,47 @@
      * 100ms setInterval on the UI thread: once a step exceeded 100ms the
      * callbacks queued up and the page stopped responding entirely.
      */
-    function pump() {
+    async function pump() {
       scheduled = false;
       if (!model || !running) return;
       var minInt = maxRate > 0 ? 1000 / maxRate : 0;
-      var t0 = now(), t1, ts;
+      var t0 = now(), t1;
 
-      if (minInt > 0) {
-        model.step();
-        t1 = now();
-        tickRate(t1);
-        // when paced slowly enough to watch, show every step
-        if (maxRate <= 20 || t1 - lastSnap >= snapEveryMs) {
-          lastSnap = t1;
-          snapshot((snapCount++ % heavyEvery) === 0);
+      try {
+        if (minInt > 0) {
+          await model.stepAsync();
+          t1 = now();
+          tickRate(t1);
+          // when paced slowly enough to watch, show every step
+          if (maxRate <= 20 || t1 - lastSnap >= snapEveryMs) {
+            lastSnap = t1;
+            await snapshot((snapCount++ % heavyEvery) === 0);
+          }
+          schedule(Math.max(0, minInt - (now() - t0)));
+          return;
         }
-        schedule(Math.max(0, minInt - (now() - t0)));
-        return;
-      }
 
-      var budget = 40;
-      do {
-        model.step();
-        t1 = now();
-      } while (running && t1 - t0 < budget);
+        var budget = 40;
+        do {
+          await model.stepAsync();
+          t1 = now();
+        } while (running && t1 - t0 < budget);
 
-      tickRate(t1);
-      if (t1 - lastSnap >= snapEveryMs) {
-        lastSnap = t1;
-        snapshot((snapCount++ % heavyEvery) === 0);
+        tickRate(t1);
+        /*
+         * On WebGPU this snapshot is also the queue drain: stepAsync only
+         * submits, so without a periodic readback the command queue would run
+         * arbitrarily far ahead of the device.
+         */
+        if (t1 - lastSnap >= snapEveryMs) {
+          lastSnap = t1;
+          await snapshot((snapCount++ % heavyEvery) === 0);
+        }
+        schedule(0);
+      } catch (err) {
+        running = false;
+        post({ type: 'error', message: String(err && err.message || err) });
       }
-      schedule(0);
     }
 
     // Always go through the task queue, never a tight loop, so pause/config
@@ -886,7 +1358,26 @@
       return typeof performance !== 'undefined' ? performance.now() : Date.now();
     }
 
-    self.onmessage = function (ev) {
+    /*
+     * Backend selection happens once, on the first init, and is cached. Each
+     * candidate must reproduce the JS reference on a probe problem before it is
+     * accepted -- see selectBackend / selfTest.
+     */
+    var backendReady = null;
+    function ensureBackend() {
+      if (!backendReady) {
+        backendReady = selectBackend({}).then(function (sel) {
+          backend = sel.backend;
+          backendName = sel.name;
+          backendTried = sel.tried;
+          post({ type: 'backend', name: sel.name, tried: sel.tried });
+          return sel;
+        });
+      }
+      return backendReady;
+    }
+
+    self.onmessage = async function (ev) {
       var d = ev.data, m = d && d.type;
       try {
         if (m === 'init') {
@@ -894,10 +1385,12 @@
           if (d.maxRate !== undefined) maxRate = d.maxRate;
           if (d.wantCoup !== undefined) wantCoup = !!d.wantCoup;
           if (d.wantTop !== undefined) wantTop = !!d.wantTop;
+          post({ type: 'progress', phase: 'backend', frac: 0 });
+          await ensureBackend();
           post({ type: 'progress', phase: 'weights', frac: 0 });
           model = new Gremlin({
             L: d.L, A: d.A, N: d.N, seqs: d.seqs, cfg: d.cfg,
-            uniformWeights: d.uniformWeights,
+            uniformWeights: d.uniformWeights, backend: backend,
             identity: d.identity, maxRefs: d.maxRefs, seed: d.seed,
             onProgress: function (f) { post({ type: 'progress', phase: 'weights', frac: f }); }
           });
@@ -905,19 +1398,24 @@
           post({
             type: 'inited', L: model.L, A: model.A, N: model.N,
             Meff: model.Meff, approxWeights: model.approxWeights,
-            params: model.P, bytes: model.bytes()
+            params: model.P, bytes: model.bytes(),
+            backend: backendName
           });
-          snapshot(true);
+          await snapshot(true);
         } else if (m === 'data') {
           // same L, new sequences: keep the learned parameters
           if (model) {
-            model.setData(d.seqs, d.N, d.uniformWeights, d.identity, d.maxRefs);
-            post({
-              type: 'inited', L: model.L, A: model.A, N: model.N,
-              Meff: model.Meff, approxWeights: model.approxWeights,
-              params: model.P, bytes: model.bytes()
-            });
-            snapshot(true);
+            if (model.setData(d.seqs, d.N, d.uniformWeights, d.identity, d.maxRefs) === false) {
+              // more sequences than the buffers were sized for; caller must re-init
+              post({ type: 'needsInit' });
+            } else {
+              post({
+                type: 'inited', L: model.L, A: model.A, N: model.N,
+                Meff: model.Meff, approxWeights: model.approxWeights,
+                params: model.P, bytes: model.bytes(), backend: backendName
+              });
+              await snapshot(true);
+            }
           }
         } else if (m === 'config') {
           if (d.maxRate !== undefined) maxRate = d.maxRate;
@@ -928,18 +1426,18 @@
           if (model && !running) { running = true; lastSnap = 0; schedule(0); }
         } else if (m === 'pause') {
           running = false;
-          snapshot(true);
+          await snapshot(true);
         } else if (m === 'reset') {
           if (model) {
             running = false; model.reset();
             rateT = 0; rateS = 0; rateSps = 0;
-            snapshot(true);
+            await snapshot(true);
           }
         } else if (m === 'select') {
-          if (model) { model.sel = d.sel | 0; if (!running) snapshot(false); }
+          if (model) { model.sel = d.sel | 0; if (!running) await snapshot(false); }
         } else if (m === 'block') {
           if (model) {
-            var blk = model.block(d.i | 0, d.j | 0);
+            var blk = await model.blockAsync(d.i | 0, d.j | 0);
             post({ type: 'block', i: d.i | 0, j: d.j | 0, A: model.A, data: blk }, [blk.buffer]);
           }
         } else if (m === 'contacts') {
@@ -947,7 +1445,7 @@
             post({ type: 'contacts', list: model.topContacts(d.minSep | 0 || 5, d.limit | 0 || 0) });
           }
         } else if (m === 'snapshot') {
-          snapshot(true);
+          await snapshot(true);
         }
       } catch (err) {
         running = false;

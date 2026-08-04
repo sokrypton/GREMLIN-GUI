@@ -59,6 +59,7 @@
         <div class="row" style="margin-bottom:16px">
           <button id="run">Start Optimization</button>
           <button id="reset" class="grey">Reset</button>
+          <span class="badge" id="backend"></span>
         </div>
         <div class="sliders3">
           <div class="sl">
@@ -362,6 +363,12 @@
       var d = ev.data;
       if (d.type === 'ready') {
         rebuild(true);
+      } else if (d.type === 'backend') {
+        var el = $('backend');
+        el.textContent = d.name;
+        el.className = 'badge ' + (d.name === 'js' ? 'badge-plain' : 'badge-fast');
+        el.title = 'Compute backend, chosen only after reproducing the JS reference on a probe problem.';
+        return;
       } else if (d.type === 'inited') {
         S.info = d;
       } else if (d.type === 'snapshot') {

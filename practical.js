@@ -116,6 +116,7 @@
       <button id="run" disabled>Start</button>
       <button id="reset" class="grey" disabled>Reset</button>
       <span class="status" id="status" style="margin:0"></span>
+      <span class="badge" id="backend" title="Selected compute backend. Each candidate must reproduce the JS reference on a probe problem before it is used."></span>
       <label class="spacer small">max steps/s
         <select id="rate"></select>
       </label>
@@ -416,6 +417,21 @@
     if (n) n.textContent = v;
   }
 
+  /* Which backend the worker settled on, and why the others were not used. */
+  function renderBackend() {
+    var b = S.backend;
+    var el = $('backend');
+    if (!b) { el.textContent = ''; return; }
+    el.textContent = b.name;
+    el.className = 'badge ' + (b.name === 'js' ? 'badge-plain' : 'badge-fast');
+    var why = (b.tried || []).map(function (t) {
+      return t.name + ': ' + (t.ok ? 'ok (dev ' + t.dev.toExponential(1) + ')'
+                                   : (t.err || 'dev ' + (t.dev || 0).toExponential(1) + ' too large'));
+    });
+    el.title = 'Compute backend: ' + b.name + '\n' + why.join('\n')
+      + '\nA backend is only used if it reproduces the JS reference on a probe problem.';
+  }
+
   function renderAll() {
     var ds = S.ds, snap = S.snap, info = S.info;
 
@@ -520,6 +536,10 @@
           ? 'computing sequence weights (' + (d.frac * 100).toFixed(0) + '%)'
           : d.phase;
         $('status').textContent = S.status;
+        return;
+      } else if (d.type === 'backend') {
+        S.backend = d;
+        renderBackend();
         return;
       } else if (d.type === 'inited') {
         S.info = d;

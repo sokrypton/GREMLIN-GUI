@@ -175,3 +175,12 @@ tbody tr { cursor: pointer; }
 tbody tr:hover { background: #f3f4f6; }
 tbody td { padding: 1px 0; }
 tbody td.dim { color: var(--faint); }
+
+/* ---- backend badge ---- */
+.badge {
+  font-family: var(--mono); font-size: 11px; font-weight: 600;
+  padding: 3px 8px; border-radius: 10px; letter-spacing: .02em;
+  text-transform: uppercase; cursor: help;
+}
+.badge-fast { background: #dcfce7; color: #166534; }
+.badge-plain { background: #e5e7eb; color: #4b5563; }

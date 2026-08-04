@@ -23,6 +23,8 @@ edu.js       practical.js     their UI
 ui.js                         shared canvas drawing + formatting
 msa.js                        FASTA/A3M parsing, filtering, encoding
 gremlin-core.js               the numeric core; runs as a Worker
+gremlin.c  gremlin.wasm       WASM SIMD backend (.wasm is committed)
+gremlin-gpu.js                WebGPU backend + WGSL shaders
 style.css                     all of it
 test/                         node tests and benchmarks
 ```
@@ -31,12 +33,21 @@ test/                         node tests and benchmarks
 numerics are testable without a browser:
 
 ```sh
-node test/core.test.mjs
+node test/core.test.mjs        # numerics, MSA parsing, cost model  (26 tests)
+node test/backends.test.mjs    # WASM + the self-test gate          (16 tests)
+node test/wgsl.test.mjs        # WGSL validation (needs naga; skips if absent)
 ```
 
-The suite checks the gradient against the *original* implementation
+`core.test.mjs` checks the gradient against the *original* implementation
 (`test/naive.mjs`, kept verbatim as an oracle), the invariants, and end-to-end
 contact recovery on a synthetic alignment with planted couplings.
+
+To rebuild the WASM module after editing `gremlin.c` (needs clang with a wasm32
+target; `gremlin.wasm` is committed so users never have to):
+
+```sh
+./build-wasm.sh
+```
 
 ## Getting an alignment
 
@@ -75,6 +86,75 @@ Two regularization conventions, because the two pages want different things:
 
 Minibatching samples sequences with probability `w_n/Meff`, which makes the cost
 per step independent of N. N = 100k costs the same as N = 256.
+
+## Backends
+
+The step runs on the fastest of three backends, picked at startup:
+
+| backend | status | speed at L=155, B=128 |
+| --- | --- | --- |
+| **WebGPU** (`gremlin-gpu.js`) | shaders validated, execution **unverified** — see below | not measured |
+| **WASM SIMD** (`gremlin.c` → `gremlin.wasm`) | measured | 117 ms/step (**3.9×** JS) |
+| **plain JS** (`gremlin-core.js`) | the reference | 462 ms/step |
+
+In the browser the WASM path takes the real `P0A7Y4` alignment from 2.1 to
+**7.1 steps/s**, so it settles in well under a minute instead of two.
+
+The active backend is shown as a badge next to the Start button; hover it to see
+what was tried and why.
+
+### Every backend has to prove itself first
+
+A candidate is not used until it reproduces the plain-JS reference — gradient,
+bias gradient, loss, updated parameters and contact map — on a small fixed probe
+problem, within 2e-3. A backend that disagrees refuses itself and the next one
+down is tried. JS is always available and is the reference, so selection cannot
+fail.
+
+This is not ceremony. A miscompiled kernel or a wrong workgroup index produces a
+*plausible-looking* contact map that is quietly wrong, which is the worst failure
+mode this tool has. `test/backends.test.mjs` checks the gate actually fires, by
+sabotaging one kernel at a time:
+
+| sabotage | deviation | verdict |
+| --- | --- | --- |
+| coupling gradient scaled by 1.05 | 7.3e-2 | rejected |
+| symmetrization skipped | 8.2 | rejected |
+| Adam learning rate off by 1.5× | 2.5 | rejected |
+| contact map offset by 0.05 | 5.0e+2 | rejected |
+| *(the real WASM backend)* | *1.3e-5* | *accepted* |
+
+The parameter check is deliberately 25× looser than the gradient check. Adam's
+first step is `lr·g/(|g|+eps)`, essentially `lr·sign(g)`, which is discontinuous
+at zero — so wherever the true gradient is near zero, a 7e-6 difference between
+two *correct* implementations can move that parameter by a full learning rate.
+Holding W as tightly as G would reject correct backends.
+
+### About the WebGPU backend
+
+It has never been executed. The environment this was written in has no WebGPU:
+Playwright's Chromium ships with the API disabled (`navigator.gpu` is undefined
+under every flag combination, and there is no Vulkan driver to fall back on).
+
+What it does have: all nine WGSL shaders are validated by
+[naga](https://github.com/gfx-rs/wgpu/tree/trunk/naga) in `test/wgsl.test.mjs`,
+which catches syntax, type, binding and control-flow errors and lowers each to
+SPIR-V. That does **not** catch a wrong index expression — which is exactly what
+the self-test gate above is for. The failure mode if a shader is wrong is that
+the probe disagrees, WebGPU refuses itself, and you silently get WASM.
+
+Design notes, for whoever finishes it on real hardware:
+
+- W, G, m and v stay in device buffers for the whole run; W is 162MB at L=155, so
+  the point is that it never crosses the bus. Only the L×L contact map (96KB)
+  and a few scalars are read back.
+- The backward pass avoids f32 atomics (which WGSL does not have) by giving one
+  workgroup one ordered position pair and keeping the whole A×A block in
+  registers: thread `a` holds `acc[b]` for all b, loops the batch accumulating
+  `acc[x_nj] += d[n][i][a]`, then writes A² values once.
+- `stepAsync` only encodes and submits — it does not block. The periodic contact
+  map readback in the snapshot path doubles as the queue drain, which is what
+  stops submissions running arbitrarily far ahead of the device.
 
 ## Performance notes
 
@@ -131,13 +211,22 @@ responsive (~20–30 ms click latency) with the worker saturated.
 
 ## Where the remaining headroom is
 
-Scalar JS is roughly at its limit. The step is two matmul-shaped passes, so
-WASM SIMD plus a few workers is worth ~4–8×, and WebGPU turns the whole step
-into two matmuls (~29 GFLOP at L=128/N=1000, i.e. tens of milliseconds on an
-integrated GPU). Sequence reweighting is O(N²L) and is the other place a GPU
-would pay off — it is currently ~10 s for 15k sequences and is approximated
-above 3000 (a biased approximation: Meff reads 8,099 at 3000 references versus
-11,406 at 500).
+WASM SIMD collected the ~4× that was available from vectorizing a single thread.
+What is left:
+
+- **Multiple workers.** The step parallelizes over positions with no shared
+  writes until the symmetrize pass, so 4 workers should be close to linear. This
+  is the largest untapped win that can actually be tested in a browser today.
+- **WebGPU**, once someone runs it on real hardware. The step is two
+  matmul-shaped passes, ~29 GFLOP at L=128/N=1000, i.e. tens of milliseconds on
+  an integrated GPU.
+- **Sequence reweighting** is O(N²L) and still ~10 s for 15k sequences even after
+  byte-packing the comparison. It is approximated above 3000 references, and that
+  approximation is biased upward — Meff reads 8,099 at 3000 references versus
+  11,406 at 500, because 1/count is convex. This is embarrassingly parallel and
+  would suit either a worker pool or the GPU.
+- **Packing the `i<j` half of W** would halve the memory ceiling, taking L=384
+  from 992MB to about 520MB.
 
 ## Benchmarks
 
