@@ -309,9 +309,25 @@
     var snap = S.snap, cv = $('cmCv');
     if (!snap || !snap.contact) { UI.fitCanvas(cv, 1, 1); return; }
     var L = snap.L, cm = snap.contact;
+    /*
+     * Sequential, not the signed red/blue ramp W uses: this panel is an APC'd
+     * Frobenius norm, so it is a magnitude and its small negatives are
+     * correction artifacts. Scaled to the largest off-diagonal score rather
+     * than the fixed +-2 -- at toy sizes the scores are well under 2, so the
+     * fixed scale left the whole map nearly blank.
+     */
+    var vmax = 0, i, j, v;
+    for (i = 0; i < L; i++) {
+      for (j = 0; j < L; j++) {
+        if (i === j) continue;
+        v = cm[i * L + j];
+        if (v > vmax) vmax = v;
+      }
+    }
     UI.drawHeatmap(cv, {
       n: L, size: HEAT, L: L, A: snap.A,
-      blocks: false, gridStroke: true, scale: HEAT_SCALE,
+      blocks: false, gridStroke: true, ramp: 'sequential',
+      scale: vmax > 0 ? vmax : HEAT_SCALE,
       get: function (i, j) { return cm[i * L + j]; }
     });
   }

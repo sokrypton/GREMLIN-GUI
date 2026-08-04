@@ -32,23 +32,47 @@
   function divCss(u) { var c = diverging(u); return 'rgb(' + c[0] + ',' + c[1] + ',' + c[2] + ')'; }
 
   /*
-   * Sequential white -> blue -> near-black over [0, 1], with negatives clamped
-   * to white. Contact scores are meant to be read as a ranking, and after APC
-   * the negative values are correction artifacts rather than signal -- painting
-   * them red (as the diverging ramp does) fills the map with speckle that
-   * competes with the real off-diagonal contacts.
+   * Sequential single-hue ramp, blank white -> blue -> near-black over [0, 1].
+   * This is what a contact map wants and the diverging ramp is simply wrong for
+   * it: after APC the score is a magnitude, not a signed quantity. Half the
+   * off-diagonal cells come out slightly negative (measured: p50 = -0.04x the
+   * anchor on the demo alignment) and those are correction artifacts, so they
+   * are blank, not red.
+   *
+   * GAMMA > 1 is the part that matters. Only 6.8% of off-diagonal pairs reach a
+   * quarter of the colour anchor, so the map should read as mostly empty with
+   * the contacts standing out of it. The old 0.7 *lifted* the low end -- a
+   * 0.25x noise cell painted at 0.38 intensity -- which flooded the background
+   * with blue speckle that competed with the real arcs. At 1.6 the same cell
+   * paints at 0.11 and the secondary-structure arcs are the first thing you see.
+   *
+   * Steps are one hue, light to dark, so the ordering survives greyscale
+   * printing and colour-vision deficiency; there is no hue change to misread.
    */
-  function sequential(u) {
-    if (!(u > 0)) return [255, 255, 255];
-    if (u > 1) u = 1;
-    u = Math.pow(u, 0.7);                 // lift the low end so weak pairs stay visible
-    if (u < 0.5) {
-      var t = u * 2;
-      return [Math.round(255 - 196 * t), Math.round(255 - 125 * t), Math.round(255 - 9 * t)];
+  var SEQ_GAMMA = 1.6;
+  var SEQ_LUT = (function () {
+    var stops = [[255, 255, 255], [205, 226, 251], [158, 197, 244], [109, 167, 236],
+                 [57, 135, 229], [37, 106, 191], [24, 79, 149], [13, 54, 107]];
+    var lut = new Array(256), k, x, s, t, a, b;
+    for (k = 0; k < 256; k++) {
+      x = (k / 255) * (stops.length - 1);
+      s = Math.min(stops.length - 2, Math.floor(x));
+      t = x - s;
+      a = stops[s]; b = stops[s + 1];
+      lut[k] = [Math.round(a[0] + (b[0] - a[0]) * t),
+                Math.round(a[1] + (b[1] - a[1]) * t),
+                Math.round(a[2] + (b[2] - a[2]) * t)];
     }
-    var s = (u - 0.5) * 2;
-    return [Math.round(59 - 42 * s), Math.round(130 - 106 * s), Math.round(246 - 207 * s)];
+    return lut;
+  })();
+
+  /* Returns a shared triple from the lookup table -- read it, do not mutate it. */
+  function sequential(u) {
+    if (!(u > 0)) return SEQ_LUT[0];
+    if (u > 1) u = 1;
+    return SEQ_LUT[Math.round(Math.pow(u, SEQ_GAMMA) * 255)];
   }
+  function seqCss(u) { var c = sequential(u); return 'rgb(' + c[0] + ',' + c[1] + ',' + c[2] + ')'; }
 
   /** Size a canvas for the device pixel ratio and return a pre-scaled context. */
   function fitCanvas(cv, w, h) {
@@ -86,10 +110,14 @@
    *   blocks      draw the L x L block grid (the coupling matrix)
    *   scale       value mapped to full colour (the original used a fixed 2)
    *   gridStroke  draw the per-cell white separator (only legible when cells are big)
+   *   ramp        'diverging' (default, for signed W) or 'sequential' (contact scores)
    * }
    */
   function drawHeatmap(cv, opts) {
     var size = opts.size, n = opts.n, L = opts.L, A = opts.A;
+    var seq = opts.ramp === 'sequential';
+    var rgb = seq ? sequential : diverging;
+    var css = seq ? seqCss : divCss;
     var padL = 35, padT = 5, padB = 35, padR = 5;
     var ctx = fitCanvas(cv, size + padL + padR, size + padT + padB);
     var cell = size / n;
@@ -111,7 +139,7 @@
       var img = new ImageData(n, n);
       for (i = 0; i < n; i++) {
         for (j = 0; j < n; j++) {
-          var c = diverging(opts.get(i, j) * inv), o = (i * n + j) * 4;
+          var c = rgb(opts.get(i, j) * inv), o = (i * n + j) * 4;
           img.data[o] = c[0]; img.data[o + 1] = c[1]; img.data[o + 2] = c[2]; img.data[o + 3] = 255;
         }
       }
@@ -121,7 +149,7 @@
     } else {
       for (i = 0; i < n; i++) {
         for (j = 0; j < n; j++) {
-          ctx.fillStyle = divCss(opts.get(i, j) * inv);
+          ctx.fillStyle = css(opts.get(i, j) * inv);
           ctx.fillRect(j * cell, i * cell, cell + 0.5, cell + 0.5);
         }
       }
@@ -386,7 +414,7 @@
 
   root.UI = {
     $: $, fmtInt: fmtInt, fmtBytes: fmtBytes,
-    diverging: diverging, divCss: divCss, sequential: sequential,
+    diverging: diverging, divCss: divCss, sequential: sequential, seqCss: seqCss,
     fitCanvas: fitCanvas, innerW: innerW,
     drawHeatmap: drawHeatmap, drawLoss: drawLoss, drawMsaRows: drawMsaRows,
     nav: nav, mergeSnap: mergeSnap,

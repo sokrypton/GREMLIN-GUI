@@ -391,6 +391,33 @@ Everything matrix-shaped is now a canvas; the network diagram draws only the
 top-K couplings; W itself never crosses to the main thread. The UI stays
 responsive (~20–30 ms click latency) with the worker saturated.
 
+### Reading the contact map
+
+The contact map gets a **sequential** ramp — blank white through blue to near
+black, one hue, light to dark — while the coupling matrix W keeps the signed
+red/white/blue one. That split is not decoration: after APC the contact score is
+a *magnitude*, and the diverging ramp paints its sign. Half the off-diagonal
+cells come out slightly negative (p50 = −0.04× the colour anchor on the demo
+alignment) and those are correction artifacts, so they belong in the blank, not
+in red.
+
+Two numbers set the ramp, and both were measured rather than eyeballed:
+
+- **Anchor at the L-th ranked score, not at max.** APC output is heavily tailed —
+  the top pair sits 4.9× the L-th here — so scaling to the maximum leaves
+  everything except a handful of cells white.
+- **γ = 1.6, not 0.7.** Only 6.8% of off-diagonal pairs reach a quarter of the
+  anchor, so the map should read as mostly empty with the contacts standing out
+  of it. The old γ = 0.7 *lifted* the low end — a 0.25× noise cell painted at
+  0.38 intensity — which flooded the background with speckle that competed with
+  the real arcs. At γ = 1.6 the same cell paints at 0.11 and the
+  secondary-structure arcs are the first thing you see.
+
+The top-L markers were then made recessive (thinner, 0.7 alpha, wide enough to
+read as a ring rather than a filled dot at ~3.5px cells). Once the ramp works,
+the darkest cells *are* the top pairs, so a saturated marker only shouts over
+what it is pointing at.
+
 ## Where the remaining headroom is
 
 WASM SIMD collected the ~4× that was available from vectorizing a single thread.

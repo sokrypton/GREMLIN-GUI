@@ -339,11 +339,18 @@
     // Nothing is ranked in a freshly reset model: every score is 0, so "top L"
     // would just circle the first L pairs in index order.
     if (S.showTop && tblRows.length && tblRows[0][2] > 0) {
-      ctx.strokeStyle = 'rgba(5,150,105,0.95)';
-      ctx.lineWidth = Math.max(1, Math.min(2, cell / 3));
+      /*
+       * Recessive on purpose. These annotate the map, they do not carry it --
+       * the ramp already makes the top pairs the darkest cells, so a saturated
+       * marker here would just shout over the thing it is pointing at. Wide
+       * enough to read as a ring around the cell rather than a filled dot,
+       * which at cell ~3.5px it otherwise does.
+       */
+      ctx.strokeStyle = 'rgba(5,150,105,0.7)';
+      ctx.lineWidth = Math.max(0.75, Math.min(1.25, cell / 4));
       marked = Math.min(L, tblRows.length);
       for (t = 0; t < marked; t++) {
-        r = Math.max(1.6, cell * 0.45);
+        r = Math.max(2.2, cell * 0.62);
         ctx.beginPath(); ctx.arc((tblRows[t][1] + 0.5) * cell, (tblRows[t][0] + 0.5) * cell, r, 0, 6.2832); ctx.stroke();
         ctx.beginPath(); ctx.arc((tblRows[t][0] + 0.5) * cell, (tblRows[t][1] + 0.5) * cell, r, 0, 6.2832); ctx.stroke();
       }
@@ -368,7 +375,7 @@
     cmGeom = { L: L, cell: cell };
     cmNote = L + ' × ' + L + ' columns'
       + (marked ? ' · top ' + marked + ' circled (|i-j| ≥ ' + S.minSep + ')' : '')
-      + (vmax > 0 ? ' · colour saturates at ' + vmax.toFixed(2) : '')
+      + (vmax > 0 ? ' · white to full colour over 0 – ' + vmax.toFixed(2) : '')
       + ' · axes are input-alignment columns';
     $('cmNote').textContent = cmNote;
   }
