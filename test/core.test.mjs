@@ -421,6 +421,54 @@ test('100k sequences parse without a spread-argument stack overflow', () => {
   assert.equal(ds.L, 4);
 });
 
+test('the redundancy filter drops near-duplicates and keeps the query', () => {
+  const text = '>q\nACDEFGHIKLACDEFGHIKL\n'
+             + '>dup\nACDEFGHIKLACDEFGHIKL\n'      // identical to the query
+             + '>near\nACDEFGHIKLACDEFGHIKW\n'     // 19/20 = 0.95
+             + '>far\nWWWWWWWWWWWWWWWWWWWW\n';
+  const off = MSA.buildDataset(text, { keepQueryColumns: false });
+  assert.equal(off.N, 4);
+
+  const at90 = MSA.buildDataset(text, { keepQueryColumns: false, maxIdentity: 0.9 });
+  assert.deepEqual(at90.names, ['q', 'far'], JSON.stringify(at90.names));
+  assert.equal(at90.redundancy.dropped, 2);
+
+  // 0.95 is not "more than 0.95", so `near` survives a 0.96 threshold
+  const at96 = MSA.buildDataset(text, { keepQueryColumns: false, maxIdentity: 0.96 });
+  assert.deepEqual(at96.names, ['q', 'near', 'far'], JSON.stringify(at96.names));
+});
+
+test('the redundancy filter keeps seqs, names, cov and idn in step', () => {
+  const sim = MSA.synthetic({ L: 20, N: 200, A: 6, nPairs: 2, seed: 64 });
+  const ds = MSA.buildDataset(sim.text, { maxIdentity: 0.8 });
+  assert.equal(ds.names.length, ds.N, 'names out of step');
+  assert.equal(ds.cov.length, ds.N, 'cov out of step');
+  assert.equal(ds.idn.length, ds.N, 'idn out of step');
+  assert.equal(ds.seqs.length, ds.N * ds.L, 'seqs out of step');
+  for (let k = 0; k < ds.seqs.length; k++) {
+    assert.ok(ds.seqs[k] >= 0 && ds.seqs[k] < ds.A, 'bad state after filtering');
+  }
+  console.log('       ' + sim.N + ' -> ' + ds.N + ' sequences at id <= 0.80');
+  assert.ok(ds.N < sim.N, 'nothing was filtered on a redundant synthetic set');
+});
+
+test('no pair above the threshold survives the filter', () => {
+  const sim = MSA.synthetic({ L: 24, N: 150, A: 5, nPairs: 2, seed: 8 });
+  const ds = MSA.buildDataset(sim.text, { maxIdentity: 0.75 });
+  const need = Math.ceil(0.75 * ds.L);
+  let worst = 0;
+  for (let n = 0; n < ds.N; n++) {
+    for (let m = n + 1; m < ds.N; m++) {
+      let id = 0;
+      for (let k = 0; k < ds.L; k++) if (ds.seqs[n * ds.L + k] === ds.seqs[m * ds.L + k]) id++;
+      if (id > worst) worst = id;
+    }
+  }
+  console.log('       highest surviving pair identity: ' + (worst / ds.L).toFixed(3)
+            + ' (threshold ' + (need / ds.L).toFixed(3) + ')');
+  assert.ok(worst < need, 'a pair above the threshold survived: ' + worst + ' >= ' + need);
+});
+
 /* ------------------------------------------------------------------ */
 section('5. cost model');
 

@@ -71,6 +71,55 @@ stripped; coverage is the non-gap fraction of a row; identity is measured
 against the query; `-`, `.`, ` ` and `X` all count as gaps. Defaults are
 coverage ≥ 0.75 and identity ≥ 0.15, sorted by identity with the query first.
 
+### Redundancy filter (max pairwise identity)
+
+Optional greedy clustering: walk the sequences in order, keep one as a
+representative, drop any later sequence more identical than the threshold to a
+representative already kept. The query is always kept, and because rows are
+sorted by identity to the query, the survivor of a cluster is the one most like
+it. It runs in the worker with progress reporting, since it is O(N × reps) and
+takes tens of seconds on a large alignment.
+
+**It is off by default, and probably should stay off.** Meff reweighting already
+down-weights near-duplicates, so this trades data for a smaller N rather than for
+accuracy. On the demo alignment (400 steps, B=128):
+
+| max identity | N | Meff | filter cost | top L/5 | top L/2 | top L |
+| --- | --- | --- | --- | --- | --- | --- |
+| off | 15,688 | 8,099 | — | 83.9% | 80.5% | 69.0% |
+| 0.99 | 15,435 | 8,033 | +6s | 80.6% | 77.9% | 67.7% |
+| 0.95 | 14,604 | 7,952 | +11s | 83.9% | 79.2% | 70.3% |
+| 0.90 | 12,528 | 7,542 | +12s | 80.6% | 79.2% | 67.1% |
+| 0.80 | 6,834 | 6,834 | +9s | 83.9% | 80.5% | 69.0% |
+
+Every row is within noise of the unfiltered baseline. The 0.80 row is the tell:
+Meff comes out exactly equal to N, because filtering at threshold *T* makes
+reweighting at *T* a no-op — the two mechanisms are doing the same job. Use the
+filter when you want a smaller N (memory, parse time, exporting a non-redundant
+set), not when you want better contacts.
+
+#### Composition prefiltering: tried, measured, removed
+
+Since every sequence occupies the same columns, the match count is bounded above
+by `Σ_a min(count₁[a], count₂[a])` — each residue type can match only as often as
+the rarer sequence contains it. The bound is exact and screens extremely well:
+**95.9% of pairs pruned at id 0.90**. It still made things *slower*:
+
+| threshold | exact only | + composition bound | pairs pruned |
+| --- | --- | --- | --- |
+| 0.90 | 9.74s | 9.92s (0.98×) | 95.9% |
+| 0.80 | 10.51s | 12.53s (0.84×) | 27.2% |
+| 0.70 | 3.47s | 4.93s (0.70×) | 2.6% |
+
+The screen costs more than the test it screens. The byte-packed comparison bails
+after `L − need + 1` mismatches — 16 of them at id 0.90, about five 32-bit word
+comparisons — while the bound needs up to 21 integer mins. A one-operation
+variant, `matches ≤ L − |gaps₁ − gaps₂|` (also exact), is cheap enough but prunes
+only 6%, and was likewise a wash.
+
+If this ever needs to be faster, the answer is an inverted k-mer index over the
+representatives, CD-HIT style, rather than a tighter per-pair bound.
+
 ## What the objective is
 
 ```

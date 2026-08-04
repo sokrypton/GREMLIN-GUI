@@ -77,6 +77,104 @@
   }
 
   /* ------------------------------------------------------------------ */
+  /* redundancy filter                                                   */
+  /* ------------------------------------------------------------------ */
+
+  /*
+   * Greedy clustering at a pairwise identity threshold: walk the sequences in
+   * order, keep one as a representative, and drop any later sequence that is
+   * more than `maxId` identical to a representative already kept. Row 0 (the
+   * query) is always a representative. Order matters, and after sortByIdentity
+   * it is descending identity to the query, so the representative kept from a
+   * cluster is the one most like the query.
+   *
+   * Identity here is "fraction of the L aligned columns that are equal",
+   * counting gap-against-gap as a match -- the same definition computeWeights
+   * uses for Meff, and the one the GREMLIN reference uses.
+   *
+   * Comparison is byte-packed, four residues per 32-bit word, with an early exit
+   * once more than L - need mismatches have accumulated.
+   *
+   * ---------------------------------------------------------------------------
+   * On prefiltering, which was tried and removed
+   * ---------------------------------------------------------------------------
+   * Because every sequence occupies the same columns, the match count is bounded
+   * above by  sum_a min(count_1[a], count_2[a])  -- each residue type can only
+   * match as often as the rarer of the two sequences contains it. That bound is
+   * exact and screens beautifully: on a 15688 x 155 alignment it prunes 95.9% of
+   * pairs at id 0.90.
+   *
+   * It still made things slower. Measured, exact-only against bound-then-exact:
+   *
+   *     id 0.90   9.74s -> 9.92s   (0.98x, 95.9% pruned)
+   *     id 0.80  10.51s -> 12.53s  (0.84x, 27.2% pruned)
+   *     id 0.70   3.47s ->  4.93s  (0.70x,  2.6% pruned)
+   *
+   * The reason is that the test being screened is already cheaper than the
+   * screen. At id 0.90 the exact comparison bails after L - need + 1 = 16
+   * mismatches, roughly five word-comparisons, while the bound costs up to 21
+   * integer mins. A one-operation variant -- matches <= L - |gaps_1 - gaps_2|,
+   * also exact -- is cheap enough but only prunes 6%, and was likewise a wash.
+   *
+   * If this ever needs to be faster the answer is an inverted k-mer index over
+   * the representatives (CD-HIT's approach), not a tighter per-pair bound.
+   *
+   * Returns { keep: Int32Array, stats }.
+   */
+  function filterRedundancy(seqs, N, L, A, maxId, onProgress) {
+    var need = Math.ceil(maxId * L);           // matches required to count as redundant
+    var n, m, k;
+
+    var words = (L / 4) | 0;
+    var tail = L - words * 4;
+    var stride = words * 4 + (tail ? 4 : 0);
+    var bytes = new Uint8Array(N * stride);
+    for (n = 0; n < N; n++) {
+      for (k = 0; k < L; k++) bytes[n * stride + k] = seqs[n * L + k];
+    }
+    var u32 = new Uint32Array(bytes.buffer);
+    var wStride = stride >> 2;
+
+    function identical(an, am) {
+      var id = 0, w, x, remaining;
+      for (w = 0; w < words; w++) {
+        x = u32[an + w] ^ u32[am + w];
+        if (x === 0) { id += 4; continue; }
+        if ((x & 0xff) === 0) id++;
+        if ((x & 0xff00) === 0) id++;
+        if ((x & 0xff0000) === 0) id++;
+        if ((x & 0xff000000) === 0) id++;
+        remaining = L - (w + 1) * 4;
+        if (id + remaining < need) return false;
+      }
+      if (tail) {
+        x = u32[an + words] ^ u32[am + words];
+        if ((tail > 0) && (x & 0xff) === 0) id++;
+        if ((tail > 1) && (x & 0xff00) === 0) id++;
+        if ((tail > 2) && (x & 0xff0000) === 0) id++;
+      }
+      return id >= need;
+    }
+
+    var keep = [], reps = [];
+    var compared = 0;
+    for (n = 0; n < N; n++) {
+      var dup = false;
+      for (var r = 0; r < reps.length; r++) {
+        compared++;
+        if (identical(n * wStride, reps[r] * wStride)) { dup = true; break; }
+      }
+      if (!dup) { reps.push(n); keep.push(n); }
+      if (onProgress && (n & 255) === 0) onProgress(n / N);
+    }
+
+    return {
+      keep: Int32Array.from(keep),
+      stats: { kept: keep.length, dropped: N - keep.length, compared: compared }
+    };
+  }
+
+  /* ------------------------------------------------------------------ */
   /* parsing                                                            */
   /* ------------------------------------------------------------------ */
 
@@ -141,6 +239,9 @@
     var minCoverage = opts.minCoverage === undefined ? 0 : opts.minCoverage;
     var minIdentity = opts.minIdentity === undefined ? 0 : opts.minIdentity;
     var sortByIdentity = !!opts.sortByIdentity;
+    // Redundancy filter: drop sequences more than this identical to one already
+    // kept. 1 (or 0) disables it. See filterRedundancy.
+    var maxIdentity = opts.maxIdentity === undefined ? 1 : opts.maxIdentity;
     var warnings = [];
 
     var rec = parseRecords(text);
@@ -282,10 +383,29 @@
       }
     }
 
+    /* ---- redundancy filter, on the encoded sequences ---- */
+    var redundancy = null;
+    if (maxIdentity > 0 && maxIdentity < 1 && N > 1) {
+      var fr = filterRedundancy(seqs, N, L, A, maxIdentity, opts.onProgress);
+      redundancy = fr.stats;
+      if (fr.keep.length < N) {
+        var kept = new Int32Array(fr.keep.length * L);
+        for (n = 0; n < fr.keep.length; n++) {
+          kept.set(seqs.subarray(fr.keep[n] * L, (fr.keep[n] + 1) * L), n * L);
+        }
+        keepSeq = Array.prototype.map.call(fr.keep, function (k) { return keepSeq[k]; });
+        seqs = kept;
+        N = fr.keep.length;
+        warnings.push('Removed ' + fr.stats.dropped + ' sequence(s) above '
+          + maxIdentity.toFixed(2) + ' identity to a kept sequence; ' + N + ' remain.');
+      }
+    }
+
     return {
       mode: digit ? 'digit' : 'protein',
       L: L, A: A, N: N,
       seqs: seqs,
+      redundancy: redundancy,
       colMap: Int32Array.from(cols),
       names: keepSeq.map(function (k) { return names[k] || ('seq' + k); }),
       cov: Float32Array.from(keepSeq, function (k) { return covs[k]; }),
@@ -388,6 +508,7 @@
     parseRecords: parseRecords,
     isDigitMode: isDigitMode,
     buildDataset: buildDataset,
+    filterRedundancy: filterRedundancy,
     synthetic: synthetic,
     afdbMsaUrl: afdbMsaUrl,
     isGap: isGap,

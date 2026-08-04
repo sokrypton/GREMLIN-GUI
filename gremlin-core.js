@@ -1302,6 +1302,10 @@
      * loadable in node. A missing or broken gremlin-gpu.js just means no WebGPU.
      */
     try { self.importScripts('gremlin-gpu.js'); } catch (e) { /* no WebGPU path */ }
+    /* msa.js is needed only for the redundancy filter, which runs here rather
+       than on the UI thread because it is O(N * representatives) and can take
+       tens of seconds on a large alignment. */
+    try { self.importScripts('msa.js'); } catch (e) { /* filter unavailable */ }
 
     var model = null;
     var backend = null;
@@ -1495,9 +1499,31 @@
           if (d.wantTop !== undefined) wantTop = !!d.wantTop;
           post({ type: 'progress', phase: 'backend', frac: 0 });
           await ensureBackend();
+          /*
+           * Redundancy filter, before the model is sized. Off by default: Meff
+           * reweighting already down-weights near-duplicates, so this trades
+           * data for a smaller N rather than for accuracy.
+           */
+          var seqs = d.seqs, nSeq = d.N;
+          if (d.maxIdentity > 0 && d.maxIdentity < 1 && nSeq > 1
+              && typeof MSA !== 'undefined' && MSA.filterRedundancy) {
+            post({ type: 'progress', phase: 'redundancy', frac: 0 });
+            var fr = MSA.filterRedundancy(seqs, nSeq, d.L, d.A, d.maxIdentity,
+              function (f) { post({ type: 'progress', phase: 'redundancy', frac: f }); });
+            if (fr.keep.length < nSeq) {
+              var packed = new Int32Array(fr.keep.length * d.L);
+              for (var q = 0; q < fr.keep.length; q++) {
+                packed.set(seqs.subarray(fr.keep[q] * d.L, (fr.keep[q] + 1) * d.L), q * d.L);
+              }
+              seqs = packed;
+              nSeq = fr.keep.length;
+            }
+            post({ type: 'filtered', keep: fr.keep, stats: fr.stats }, [fr.keep.buffer]);
+          }
+
           post({ type: 'progress', phase: 'weights', frac: 0 });
           model = new Gremlin({
-            L: d.L, A: d.A, N: d.N, seqs: d.seqs, cfg: d.cfg,
+            L: d.L, A: d.A, N: nSeq, seqs: seqs, cfg: d.cfg,
             uniformWeights: d.uniformWeights, backend: backend,
             gap: d.gap, biasInit: d.biasInit,
             identity: d.identity, maxRefs: d.maxRefs, seed: d.seed,

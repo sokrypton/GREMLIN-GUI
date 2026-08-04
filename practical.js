@@ -43,7 +43,11 @@
      */
     cfg: { alpha: 0.01, beta: 0.01, lr: 0.05, batch: 128, regMode: 'gremlin' },
     prep: { keepQueryColumns: true, maxColGap: 1, minCoverage: 0.75, minIdentity: 0.15,
-            sortByIdentity: true, dedup: false }
+            sortByIdentity: true, dedup: false },
+    // Redundancy filter, run in the worker. Off by default: Meff reweighting
+    // already handles near-duplicates, and on the demo alignment filtering at
+    // 0.90 costs ~12s and leaves contact precision unchanged.
+    maxIdentity: 1
   };
 
   var worker = null;
@@ -90,6 +94,10 @@
       <div class="sl">
         <label>max column gaps: <span class="val" id="vCol"></span></label>
         <input type="range" id="sCol" min="0.1" max="1" step="0.05">
+      </div>
+      <div class="sl">
+        <label title="Greedy clustering: drop sequences more identical than this to one already kept. Meff reweighting already handles redundancy, so this mainly reduces N.">max pairwise identity: <span class="val" id="vRed"></span></label>
+        <input type="range" id="sRed" min="0.5" max="1" step="0.01">
       </div>
       <div class="col-checks">
         <label class="cb"><input type="checkbox" id="cQuery" checked> query columns only</label>
@@ -234,13 +242,16 @@
     ['sIdn', 'vIdn', 'minIdentity', function (v) { return v <= 0 ? 'off' : v.toFixed(2); }],
     ['sCol', 'vCol', 'maxColGap', function (v) { return v >= 1 ? 'off' : v.toFixed(2); }]
   ];
+  FILT.push(['sRed', 'vRed', 'maxIdentity',
+             function (v) { return v >= 1 ? 'off' : v.toFixed(2); }]);
   FILT.forEach(function (f) {
     var rng = $(f[0]), lab = $(f[1]);
-    rng.value = S.prep[f[2]];
-    lab.textContent = f[3](S.prep[f[2]]);
+    var host = f[2] === 'maxIdentity' ? S : S.prep;
+    rng.value = host[f[2]];
+    lab.textContent = f[3](host[f[2]]);
     rng.addEventListener('input', function () {
-      S.prep[f[2]] = Number(rng.value);
-      lab.textContent = f[3](S.prep[f[2]]);
+      host[f[2]] = Number(rng.value);
+      lab.textContent = f[3](host[f[2]]);
     });
   });
   [['cQuery', 'keepQueryColumns'], ['cSort', 'sortByIdentity'], ['cDedup', 'dedup']].forEach(function (p) {
@@ -538,8 +549,31 @@
       } else if (d.type === 'progress') {
         S.status = d.phase === 'weights'
           ? 'computing sequence weights (' + (d.frac * 100).toFixed(0) + '%)'
-          : d.phase;
+          : d.phase === 'redundancy'
+            ? 'redundancy filter (' + (d.frac * 100).toFixed(0) + '%)'
+            : d.phase;
         $('status').textContent = S.status;
+        return;
+      } else if (d.type === 'filtered') {
+        /* The worker dropped redundant rows; subset our copy so the MSA panel
+           and the selected-row index keep matching the model. */
+        var ds = S.ds, keep = d.keep;
+        if (ds && keep.length < ds.N) {
+          var sub = new Int32Array(keep.length * ds.L), q;
+          for (q = 0; q < keep.length; q++) {
+            sub.set(ds.seqs.subarray(keep[q] * ds.L, (keep[q] + 1) * ds.L), q * ds.L);
+          }
+          ds.seqs = sub;
+          ds.names = Array.prototype.map.call(keep, function (k) { return ds.names[k]; });
+          ds.cov = Float32Array.from(keep, function (k) { return ds.cov[k]; });
+          ds.idn = Float32Array.from(keep, function (k) { return ds.idn[k]; });
+          ds.N = keep.length;
+          ds.warnings = ds.warnings.concat(['Redundancy filter removed '
+            + d.stats.dropped + ' sequence(s) above ' + S.maxIdentity.toFixed(2)
+            + ' identity; ' + ds.N + ' remain.']);
+          S.sel = 0;
+        }
+        renderAll();
         return;
       } else if (d.type === 'backend') {
         S.backend = d;
@@ -614,7 +648,7 @@
       type: 'init', L: ds.L, A: ds.A, N: ds.N, seqs: copy,
       cfg: S.cfg, maxRate: S.maxRate, identity: 0.8, maxRefs: 3000, seed: 1234567,
       wantCoup: false, wantTop: false,
-      gap: ds.gap, biasInit: 'freq'
+      gap: ds.gap, biasInit: 'freq', maxIdentity: S.maxIdentity
     }, [copy.buffer]);
   }
 
