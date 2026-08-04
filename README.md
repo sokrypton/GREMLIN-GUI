@@ -39,8 +39,9 @@ node test/wgsl.test.mjs        # WGSL validation (needs naga; skips if absent)
 node test/eval-precision.mjs   # contact precision vs an AlphaFold structure
 ```
 
-`eval-precision.mjs` is how the reference-alignment choices below were decided;
-it needs two AFDB files it does not ship and prints how to fetch them.
+`eval-precision.mjs` is how the four changes in "Matching the reference"
+below were decided; it needs two AFDB files it does not ship and prints how to
+fetch them.
 
 `core.test.mjs` checks the gradient against the *original* implementation
 (`test/naive.mjs`, kept verbatim as an oracle), the invariants, and end-to-end
@@ -94,7 +95,7 @@ objective batch-invariant for free: the reference has to scale `lam` by `B/N`
 when it minibatches because its data term is a sum, whereas ours is already a
 per-sequence mean.
 
-## Agreement with the reference implementation
+## Matching the reference
 
 Checked against [`sokrypton/laxy`
 `examples/gremlin_jax.ipynb`](https://github.com/sokrypton/laxy/blob/main/examples/gremlin_jax.ipynb)
@@ -104,12 +105,14 @@ and Adam is invariant to the constant.
 
 Four things were wrong here and are now fixed. To decide rather than guess, each
 was scored against the AlphaFold model for the demo protein (`P0A7Y4`, RNase H,
-155 residues, 372 true contacts at CB < 8Å and |i−j| ≥ 5), 400 steps at B=128:
+155 residues, 372 true contacts at CB < 8Å and |i−j| ≥ 5), 400 steps at B=128.
+The second row has all four changes applied; each `ablate:` row below turns
+exactly one of them back off:
 
 | | top L/5 | top L/2 | top L |
 | --- | --- | --- | --- |
 | before | 77.4% | 76.6% | 67.1% |
-| **reference-aligned** | **83.9%** | **80.5%** | **69.0%** |
+| **all four changes** | **83.9%** | **80.5%** | **69.0%** |
 | ablate: gaps back in the norm | 83.9% | 76.6% | 67.1% |
 | ablate: bias starts at zero | 80.6% | 79.2% | 66.5% |
 | ablate: old fixed lr 0.05 | 77.4% | 79.2% | 65.8% |

@@ -89,9 +89,9 @@ function precision(g, steps) {
 }
 
 const CONFIGS = [
-  { name: 'before (this branch, pre-reference)',
+  { name: 'before (none of the four changes)',
     gap: -1, biasInit: 'zero', alpha: 0.02, lr: 0.05 },
-  { name: 'reference-aligned (all four changes)',
+  { name: 'all four changes (what ships)',
     gap: 20, biasInit: 'freq', alpha: 0.01, lr: null },
   { name: '  ablate: gaps back in the norm',
     gap: -1, biasInit: 'freq', alpha: 0.01, lr: null },
