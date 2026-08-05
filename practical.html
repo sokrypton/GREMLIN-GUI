@@ -3,15 +3,18 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>GREMLIN Visualization</title>
+  <title>GREMLIN &mdash; practical</title>
   <link rel="stylesheet" href="style.css">
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23fff'/%3E%3Crect x='1' y='1' width='14' height='14' fill='none' stroke='%23111'/%3E%3Crect x='2' y='2' width='2' height='2' fill='%233b82f6'/%3E%3Crect x='12' y='12' width='2' height='2' fill='%233b82f6'/%3E%3Crect x='5' y='9' width='2' height='2' fill='%233b82f6'/%3E%3Crect x='9' y='5' width='2' height='2' fill='%233b82f6'/%3E%3C/svg%3E">
   <!--
-    Educational page: same layout, wording, slider ranges, defaults and step
-    pacing as the original. No dependencies -- the original pulled React,
-    ReactDOM, prop-types, recharts, Tailwind and @babel/standalone (~2.9MB plus
-    a JSX transpile on every load); none of it was earning its place once the
-    optimizer moved to a worker and the heat maps became canvases.
+    Practical page: real alignments from AlphaFold DB or your own file, with one
+    output that matters -- APC(L2norm(gauge-fixed w)) -- redrawn live while the
+    optimizer runs.
+
+    Input conventions match py2Dmol so the two agree on what an alignment is:
+    a3m lowercase columns are insertions, coverage is the non-gap fraction of a
+    row, identity is measured against the query, '-' '.' ' ' and 'X' all count
+    as gaps, and the defaults are coverage >= 0.75 and identity >= 0.15.
   -->
 </head>
 <body>
@@ -22,7 +25,7 @@
   <script src="ui.js"></script>
   <!-- gremlin-core.js is NOT loaded here: it runs as a Worker, so the optimizer
        never touches the UI thread. -->
-  <script src="edu.js"></script>
+  <script src="practical.js"></script>
 
   <script>
     if (location.protocol === 'file:') {
@@ -31,7 +34,7 @@
         '<b>Serve this over HTTP.</b><br>Web Workers are blocked on the ' +
         '<code>file://</code> origin. From this directory:<br><br>' +
         '<code>python3 -m http.server 8000</code><br><br>then open ' +
-        '<code>http://localhost:8000/</code>.</div>';
+        '<code>http://localhost:8000/practical.html</code>.</div>';
     }
   </script>
 </body>

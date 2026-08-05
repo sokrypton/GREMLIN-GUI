@@ -1,1 +1,4 @@
 .DS_Store
+vendor/
+index.local.html
+node_modules/
