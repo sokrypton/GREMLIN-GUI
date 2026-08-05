@@ -443,6 +443,13 @@ Everything matrix-shaped is now a canvas; the network diagram draws only the
 top-K couplings; W itself never crosses to the main thread. The UI stays
 responsive (~20–30 ms click latency) with the worker saturated.
 
+One trap in that last change, since it cost the diagram half its lines: W is
+symmetric, so `topCouplings` enumerates the `i<j` half only — but a coupling
+feeds *two* conditionals, pushing x'(j,b) from x(i,a) and x'(i,a) from x(j,b).
+The original looped over all ordered pairs and got both directions for free;
+top-K has to mirror each quintuple explicitly. Ranking is unaffected, since the
+two copies share a magnitude.
+
 ### Reading the contact map
 
 The contact map gets a **sequential** ramp — blank white through blue to near

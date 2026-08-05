@@ -99,7 +99,9 @@ button {
   padding: 8px 16px; cursor: pointer; color: #fff; background: var(--blue);
 }
 button:hover { background: var(--blue-dark); }
-button:disabled { opacity: .4; cursor: default; }
+/* pointer-events off so the :hover colour rules below cannot fire on a
+   disabled button, which otherwise reads as still clickable */
+button:disabled { opacity: .4; cursor: default; pointer-events: none; }
 button.stop { background: var(--red); }
 button.stop:hover { background: var(--red-dark); }
 button.grey { background: #6b7280; }
