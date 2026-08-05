@@ -228,6 +228,57 @@ if (aL.length) {
   }
 }
 
-if (!lr.length && !al.length && !aL.length) {
+/* ---------------- holdout: the correction against plain 1/Meff ------------- */
+const ho = load('holdout');
+if (ho.length) {
+  console.log('\n' + '='.repeat(84));
+  console.log('HELD-OUT head-to-head: does the depth correction beat plain 1/Meff?  @400 steps');
+  console.log('='.repeat(84));
+  console.log('proteins fetched after the exponent was fitted; paired by protein x depth,');
+  console.log('same subsample, same seed, only alpha differs\n');
+  const cells = new Map();
+  for (const r of ho) {
+    const k = r.acc + '|' + r.rows;
+    if (!cells.has(k)) cells.set(k, { acc: r.acc, L: r.L, rows: r.rows, Meff: r.Meff, s: {} });
+    cells.get(k).s[r.setting] = r.p;
+  }
+  const complete = [...cells.values()].filter(c => c.s.ref && c.s.expo && c.s.full);
+  const groups = [
+    { name: 'shallow (subsampled)', f: (c) => c.rows > 0 },
+    { name: 'full depth', f: (c) => c.rows === 0 },
+    { name: 'all cells', f: () => true }
+  ];
+  const metrics = [['top L/5', 'l5'], ['top L/2', 'l2'], ['top L', 'l']];
+  for (const g of groups) {
+    const sub = complete.filter(g.f);
+    if (!sub.length) continue;
+    console.log('--- ' + g.name + ' (n=' + sub.length + ') ---');
+    console.log('metric'.padEnd(10) + 'ref'.padStart(8) + 'expo'.padStart(8) + 'full'.padStart(8)
+      + '     expo-ref        full-ref');
+    for (const [nm, key] of metrics) {
+      const mean = (s) => sub.reduce((a, c) => a + c.s[s][key], 0) / sub.length;
+      const paired = (s) => {
+        const d = sub.map(c => c.s[s][key] - c.s.ref[key]);
+        const m = d.reduce((a, b) => a + b, 0) / d.length;
+        const v = d.reduce((a, b) => a + (b - m) ** 2, 0) / Math.max(1, d.length - 1);
+        return { m, se: Math.sqrt(v / d.length), win: d.filter(x => x > 1e-9).length,
+                 loss: d.filter(x => x < -1e-9).length };
+      };
+      const e = paired('expo'), f = paired('full');
+      const show = (p) => ((p.m >= 0 ? '+' : '') + (p.m * 100).toFixed(2) + '±'
+        + (p.se * 100).toFixed(2) + ' (' + p.win + 'W/' + p.loss + 'L)').padStart(16);
+      console.log(nm.padEnd(10)
+        + (mean('ref') * 100).toFixed(1).padStart(8)
+        + (mean('expo') * 100).toFixed(1).padStart(8)
+        + (mean('full') * 100).toFixed(1).padStart(8)
+        + show(e) + show(f));
+    }
+    console.log('');
+  }
+  console.log('a coefficient whose CI excludes zero and a formula that predicts better');
+  console.log('are different claims; this table is the second one.');
+}
+
+if (!lr.length && !al.length && !aL.length && !ho.length) {
   console.log('no results yet -- run sweep.mjs (see README.md)');
 }
