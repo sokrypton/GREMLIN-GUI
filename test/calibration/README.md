@@ -21,6 +21,8 @@ optimum means the exponent is off.
 
 node sweep.mjs --arm=lr                           # 12 proteins x 5 multipliers, ~60 min
 node sweep.mjs --arm=alpha                        # 6 proteins x 4 depths x 6 multipliers
+node sweep.mjs --arm=alphaL --meff=400,1500 \
+               --mults=0.125,0.25,0.5,1,2         # length scaling, depth held fixed
 
 node analyse.mjs                                  # read results/*.jsonl
 ```
@@ -50,6 +52,14 @@ contacts among 630 pairs — top-L/2 is 4 hits out of 20 — against 372 among
 that resolution. Length therefore varies by using naturally different proteins.
 Depth still varies by subsampling, which genuinely does give a shallower
 alignment of the same protein.
+
+**Hold depth fixed when testing the length scaling.** `lam_w` carries both
+`(L-1)(A-1)` and `1/Meff`, so comparing proteins of different length at whatever
+depth they happen to have measures the two together — and deeper alignments
+masquerade as longer ones. `--meff=<targets>` subsamples each protein to a target
+Meff first. The row count is solved in closed form from the full-depth weights
+(subsampling by `f` gives `cnt_n -> 1 + f*(cnt_n - 1)`), so it costs nothing, and
+the Meff recorded is the real one measured afterwards.
 
 **Do not read the argmax on its own.** On a flat surface the argmax is decided
 by a single contact, and an exponent fitted through a row of such argmaxes looks

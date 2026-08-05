@@ -375,7 +375,41 @@ itself only spans 3.8×, well inside a ±4× basin, so a single constant rate wo
 also have sat in the basin at every length tested. The `1/L` exponent earns its
 place over a wider length range than this sweep covers, not within it.
 
-#### α: the reference's `1/Meff` under-corrects, but we keep it
+#### α and length: `(L−1)(A−1)` is right
+
+`λ_w` carries two scalings, so sweeping α across proteins of different length
+only measures the length one if depth is held fixed — otherwise a deeper
+alignment reads as a longer one. Depth is pinned by subsampling each protein to
+a target Meff. Subsampling by *f* thins every neighbourhood, so
+`cnt_n → 1 + f(cnt_n − 1)` and `Meff(f) ≈ f·Σ 1/(1 + f(cnt_n − 1))`; since
+`cnt_n = 1/sw_n` from one full-depth pass, the row count that hits a target is
+closed-form. It is not a small correction — reaching Meff ≈ 450 takes 744 rows at
+L=70 and 856 at L=176.
+
+Eight proteins, L = 70–196, at two matched depths:
+
+| target Meff | short (L<120) peak | long (L≥120) peak | |
+| --- | --- | --- | --- |
+| 400 | ×1 | ×1 | identical |
+| 1500 | ×0.125 | ×0.25 | adjacent, differ by 0.6pt at 1.0 s.e. |
+
+**No length dependence survives**, so the `(L−1)(A−1)` factor already carries it
+and there is nothing for a multiplier to fix. Per-protein argmaxes do wander
+(one protein peaks at ×0.125 for one target and ×2 for the other) but those
+curves are flat and the argmax is decided by a contact or two — the bin curves
+are the statistic that means something here.
+
+This also settles an earlier confusion. At full depth the short proteins looked
+like they wanted ×0.125 and the long ones ×0.5, which would have implied the
+length factor was under-correcting. That was depth leaking through: those long
+proteins sat at lower Meff (P0A7B8 at 2025 against up to 8465 for the short
+ones). With depth matched, the split disappears.
+
+And it de-confounds the depth result below. The optimum still moves with depth at
+fixed length — ×1 at Meff 400 down to ~×0.2 at Meff 1500 — so that effect is
+depth, not length wearing a disguise.
+
+#### α and depth: the reference's `1/Meff` under-corrects, but we keep it
 
 Depth is varied by subsampling, which genuinely does give a shallower alignment
 of the same protein. Six proteins, deviation from each protein's own mean:

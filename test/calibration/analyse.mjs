@@ -158,4 +158,76 @@ if (al.length) {
   }
 }
 
-if (!lr.length && !al.length) console.log('no results yet -- run sweep.mjs (see README.md)');
+/* ---------------- alphaL arm: length axis, depth held fixed ---------------- */
+const aL = load('alphaL');
+if (aL.length) {
+  const M = [...new Set(aL.map(r => r.aMult))].sort((a, b) => a - b);
+  const targets = [...new Set(aL.map(r => r.target))].sort((a, b) => a - b);
+  console.log('\n' + '='.repeat(86));
+  console.log('alpha multiplier vs LENGTH at matched depth  @' + CK + ' steps');
+  console.log('='.repeat(86));
+  console.log('the (L-1)(A-1) factor is only testable with Meff held fixed; otherwise a');
+  console.log('deeper alignment reads as a longer one\n');
+  for (const t of targets) {
+    const sub = aL.filter(r => r.target === t);
+    console.log('--- target Meff ' + t + ' ---');
+    console.log('protein'.padEnd(10) + 'L'.padStart(5) + 'Meff'.padStart(7)
+      + M.map(m => ('x' + m).padStart(8)).join('') + '    peak');
+    console.log('-'.repeat(86));
+    const pts = [];
+    const accs = [...new Set(sub.map(r => r.acc))]
+      .sort((a, b) => (sub.find(r => r.acc === a).L) - (sub.find(r => r.acc === b).L));
+    for (const acc of accs) {
+      const cells = M.map(m => {
+        const r = sub.find(x => x.acc === acc && x.aMult === m);
+        return r && r.at[CK] ? r.at[CK].l2 : null;
+      });
+      if (cells.some(c => c === null)) continue;
+      let bi = 0;
+      cells.forEach((c, i) => { if (c > cells[bi]) bi = i; });
+      const row = sub.find(r => r.acc === acc);
+      pts.push({ L: row.L, m: M[bi] });
+      console.log(acc.padEnd(10) + String(row.L).padStart(5) + row.Meff.toFixed(0).padStart(7)
+        + cells.map(c => (c * 100).toFixed(1).padStart(8)).join('')
+        + ('x' + M[bi]).padStart(8));
+    }
+    // within-protein curve, and whether its peak moves with L
+    const shortC = curve(sub.filter(r => r.L < 120), M, 'aMult');
+    const longC = curve(sub.filter(r => r.L >= 120), M, 'aMult');
+    for (const [nm, c] of [['L < 120', shortC], ['L >= 120', longC]]) {
+      if (!c) continue;
+      console.log('  ' + nm.padEnd(10) + ' n=' + c.n + '  deviation'
+        + c.mean.map((v, i) => fmt(v, c.se[i]).padStart(12)).join('')
+        + '   peak x' + M[c.bi]);
+    }
+    /*
+     * The per-protein argmax slope is reported but must not be read as an
+     * exponent: these curves are flat, so each protein's argmax is decided by a
+     * contact or two and jumps around (a protein peaking at x0.125 for one
+     * target and x2 for the other is jitter, not length dependence). The
+     * question that the data can answer is whether the SHORT and LONG bin
+     * curves peak in the same place -- if they do, (L-1)(A-1) already carries
+     * the length dependence and there is nothing left for a multiplier to fix.
+     */
+    const s = slope(pts.map(p => Math.log(p.L)), pts.map(p => Math.log(p.m)));
+    if (s !== null) {
+      console.log('  per-protein argmax slope: L^' + s.toFixed(2)
+        + '  (jitter on flat curves -- do not read as an exponent)');
+    }
+    if (shortC && longC) {
+      const same = M[shortC.bi] === M[longC.bi];
+      const gap = longC.mean[longC.bi] - longC.mean[shortC.bi];
+      const pooled = Math.sqrt(longC.se[longC.bi] ** 2 + longC.se[shortC.bi] ** 2);
+      console.log('  short peaks x' + M[shortC.bi] + ', long peaks x' + M[longC.bi]
+        + (same ? '  -- SAME: no length dependence left over'
+                : '  -- differ by ' + fmt(gap) + 'pt ('
+                  + (pooled > 0 ? (gap / pooled).toFixed(1) : '?') + ' s.e.'
+                  + (pooled > 0 && Math.abs(gap / pooled) < 2 ? ', not distinguishable' : '') + ')'));
+    }
+    console.log('');
+  }
+}
+
+if (!lr.length && !al.length && !aL.length) {
+  console.log('no results yet -- run sweep.mjs (see README.md)');
+}
