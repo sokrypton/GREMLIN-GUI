@@ -26,6 +26,7 @@ node sweep.mjs --arm=alphaL --meff=400,1500 \
 
 node analyse.mjs                                  # per-arm curves
 node refit.mjs                                    # pooled fit of the depth exponent
+node holdout.mjs                                  # A/B on proteins not in the fit
 ```
 
 Slices run in parallel on separate cores, and every run is resumable — results
@@ -61,6 +62,15 @@ masquerade as longer ones. `--meff=<targets>` subsamples each protein to a targe
 Meff first. The row count is solved in closed form from the full-depth weights
 (subsampling by `f` gives `cnt_n -> 1 + f*(cnt_n - 1)`), so it costs nothing, and
 the Meff recorded is the real one measured afterwards.
+
+**Fit and holdout are different questions, and the answers differed.** The
+pooled fit put the depth exponent at Meff^-1.44 with a CI excluding the
+reference's Meff^-1, and predicted +1.4 to +2.4 points at deep MSAs. Run head to
+head on 15 proteins fetched after the fit, the measured difference is +0.26+/-0.25
+on top L/2 and -0.46+/-0.25 on top L. The predicted gain did not appear. Only 5 of
+40 fitted cells sat above Meff 4000, so the prediction lived in the thinnest part
+of the data. `holdout.mjs` exists so this check is cheap to repeat rather than
+skipped.
 
 **Prefer the pooled fit to a row of argmaxes.** `analyse.mjs` shows the curves
 per arm; `refit.mjs` fits the depth exponent from every alpha cell at once, which

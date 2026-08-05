@@ -453,13 +453,41 @@ But the magnitude is smaller than the argmax suggested, and so is the payoff:
 | 4636 | ×0.30 | +1.4 pt |
 | 10570 | ×0.21 | +2.4 pt |
 
-Averaged over the experiment's cells that is **+0.5 points**. It only reaches
-~2 points at the deep end — which, to be fair to it, is where the practical page
-actually lives, since AFDB alignments run 5–15k sequences.
+Averaged over the experiment's cells that is +0.5 points, reaching ~2 points at
+the deep end. **Those numbers are predictions, not measurements** — they come
+from evaluating the fitted parabola at its own vertex against the same parabola
+at ×1, on the data the parabola was fitted to.
 
-**The shipped default stays at the reference — α = 0.01 with Meff^−1.** The
-effect is statistically supported and still small, and two caveats bite harder
-than the CI does:
+#### It does not survive a holdout
+
+So the formulas were run head to head on **15 proteins fetched after the
+exponent was fitted** (L 75–179, 11–16k deep, zero overlap with any fitting arm),
+paired by protein × depth — same subsample, same seed, same step count, only α
+differs. `expo` is the corrected exponent `(700/Meff)^0.44`; `full` is the fitted
+optimum, which also drops α by 0.688 at the pin.
+
+Paired difference against the reference, in points (n = 30 cells):
+
+| metric | ref | expo − ref | full − ref |
+| --- | --- | --- | --- |
+| top L/5 | 67.9 | +0.30 ± 0.50 (7W/4L) | +0.25 ± 0.57 (8W/7L) |
+| top L/2 | 54.8 | +0.26 ± 0.25 (10W/6L) | +0.64 ± 0.30 (13W/5L) |
+| top L | 43.2 | **−0.46 ± 0.25** (6W/16L) | −0.37 ± 0.31 (12W/16L) |
+
+At full depth alone, where the fit predicted +1.4 to +2.4 points, the measured
+difference is +0.17 ± 0.35 on top L/2 and **−0.52 ± 0.42 on top L** (3W/9L).
+The predicted gain does not appear, and top-L gets slightly worse.
+
+The reason is visible in where the fit's evidence sat: only **5 of 40 fitted
+cells** were above Meff 4000 — one apiece at 5910, 8465 and 10570 — so the whole
+predicted gain lived in the thinnest part of the data, and the holdout's
+full-depth Meff tops out at 5863 (median 3716). An exponent whose confidence
+interval excludes Meff^−1 and a formula that predicts better on new proteins are
+different claims. The first held; the second did not.
+
+**The shipped default stays at the reference — α = 0.01 with Meff^−1** — and now
+for a measured reason rather than a cautious one. Two caveats also still apply to
+the in-sample effect:
 
 - Depth here is a *subsample of a deep family*, not a genuinely shallow family. A
   random 128-sequence slice of a 15k-member family is still drawn from something
@@ -467,14 +495,15 @@ than the CI does:
   different object, and that is the case a user with a shallow MSA is actually in.
 - Fixed 400 steps, one contact definition, E. coli proteins only.
 
-If it is ever adopted, pin it where α = 0.01 is already right rather than
-silently rescaling everything:
+The form that was on the table, had the holdout gone the other way, was
+`λ_w = 0.5·α·(L−1)(A−1)/Meff · (700/Meff)^0.44` — pinned at Meff ≈ 700 so
+mid-depth alignments stay untouched and only the two ends bend. It is recorded
+here because the in-sample effect is reproducible and someone will find it again;
+what is also recorded is that it bought nothing on 15 proteins it had not seen.
 
-```
-λ_w = 0.5·α·(L−1)(A−1)/Meff · (700/Meff)^0.44
-```
-
-which leaves mid-depth alignments untouched and only bends the two ends.
+The whole α investigation is a worked example of the difference between an effect
+that is real in a sample and one that transfers. It survived a bracketing check,
+a length-confound check and a bootstrap, and still did not generalize.
 
 ### The GREMLIN_TF optimizer, tested and not adopted
 
