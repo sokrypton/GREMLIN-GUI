@@ -32,7 +32,6 @@
     err: null,
     sel: 0,
     minSep: 5,
-    showTop: true,
     maxRate: 0,             // real alignments never hit a display cap; run flat out
     /*
      * batch 128 rather than 256: the Adam update is O(L^2 A^2) and independent
@@ -138,7 +137,6 @@
       <h2>Contact map</h2>
       <div class="note mono">APC(L2norm(gauge-fixed <span class="w">w</span>))</div>
       <div class="row" style="margin-bottom:10px">
-        <label class="cb"><input type="checkbox" id="showTop" checked> mark top L</label>
         <label class="small">min |i-j| <input type="number" id="minSep" min="1" max="30"></label>
       </div>
       <div id="cmWrap"><canvas id="cmCv" class="clickable"></canvas></div>
@@ -324,10 +322,34 @@
       $('cmNote').textContent = '';
       return;
     }
-    var L = snap.L, cm = snap.contact;
+    var L = snap.L, cm = snap.contact, ds = S.ds;
     var size = Math.max(280, Math.min(560, UI.innerW($('cmWrap'), 420) - 44));
     var pad = CM_PAD;
     var ctx = UI.fitCanvas(cv, size + pad + 6, size + pad + 6);
+
+    /*
+     * Scatter the L x L model matrix into the display frame, which puts back the
+     * columns the gap-fraction filter removed. Without this the map silently
+     * closes the holes, so two positions either side of a dropped column are
+     * drawn touching the diagonal as if they were sequential neighbours -- the
+     * one reading of a contact map you never want to get wrong. Dropped rows and
+     * columns stay zero, which the ramp paints blank.
+     *
+     * With the filter off, frameL === L and this is a no-op copy, so nothing
+     * changes in the default view.
+     */
+    var slot = ds && ds.colSlot, D = (ds && ds.frameL) || L;
+    var disp = cm, back = null;
+    if (slot && D > L && slot.length >= L) {
+      disp = new Float32Array(D * D);
+      back = new Int32Array(D).fill(-1);            // frame slot -> model column
+      for (var p = 0; p < L; p++) back[slot[p]] = p;
+      for (var q = 0; q < L; q++) {
+        for (var r2 = 0; r2 < L; r2++) disp[slot[q] * D + slot[r2]] = cm[q * L + r2];
+      }
+    } else {
+      D = L;
+    }
 
     /*
      * Anchor the colour scale at the L-th ranked score rather than at
@@ -351,46 +373,34 @@
 
     // native-resolution paint, scaled up with smoothing off
     var off = document.createElement('canvas');
-    off.width = L; off.height = L;
-    var img = new ImageData(L, L);
-    for (var k = 0; k < L * L; k++) {
-      var c = UI.sequential(cm[k] * inv);
+    off.width = D; off.height = D;
+    var img = new ImageData(D, D);
+    for (var k = 0; k < D * D; k++) {
+      var c = UI.sequential(disp[k] * inv);
       img.data[k * 4] = c[0]; img.data[k * 4 + 1] = c[1]; img.data[k * 4 + 2] = c[2]; img.data[k * 4 + 3] = 255;
     }
     off.getContext('2d').putImageData(img, 0, 0);
     ctx.imageSmoothingEnabled = false;
-    ctx.drawImage(off, 0, 0, L, L, 0, 0, size, size);
+    ctx.drawImage(off, 0, 0, D, D, 0, 0, size, size);
 
-    var cell = size / L, marked = 0, t, r;
-    // Nothing is ranked in a freshly reset model: every score is 0, so "top L"
-    // would just circle the first L pairs in index order.
-    if (S.showTop && tblRows.length && tblRows[0][2] > 0) {
-      /*
-       * Recessive on purpose. These annotate the map, they do not carry it --
-       * the ramp already makes the top pairs the darkest cells, so a saturated
-       * marker here would just shout over the thing it is pointing at. Wide
-       * enough to read as a ring around the cell rather than a filled dot,
-       * which at cell ~3.5px it otherwise does.
-       */
-      ctx.strokeStyle = 'rgba(5,150,105,0.7)';
-      ctx.lineWidth = Math.max(0.75, Math.min(1.25, cell / 4));
-      marked = Math.min(L, tblRows.length);
-      for (t = 0; t < marked; t++) {
-        r = Math.max(2.2, cell * 0.62);
-        ctx.beginPath(); ctx.arc((tblRows[t][1] + 0.5) * cell, (tblRows[t][0] + 0.5) * cell, r, 0, 6.2832); ctx.stroke();
-        ctx.beginPath(); ctx.arc((tblRows[t][0] + 0.5) * cell, (tblRows[t][1] + 0.5) * cell, r, 0, 6.2832); ctx.stroke();
-      }
-    }
+    /*
+     * No top-L markers. Once the ramp anchors at the L-th ranked score, the top
+     * L pairs ARE the darkest cells, so circling them drew a second copy of
+     * information the colour already carried -- and against a mostly-white map
+     * the rings became the loudest thing on it. The ranked table beside the map
+     * gives the exact list when you want it.
+     */
+    var cell = size / D;
     ctx.strokeStyle = '#111';
     ctx.lineWidth = 1;
     ctx.strokeRect(0.5, 0.5, size - 1, size - 1);
 
-    // ticks in input-alignment numbering
-    var map = S.ds && S.ds.colMap;
-    var every = Math.max(1, Math.ceil(L / Math.max(2, Math.floor(size / 44))));
+    // ticks in input-alignment numbering, over the display frame
+    var map = back ? (ds && ds.frameMap) : (ds && ds.colMap);
+    var every = Math.max(1, Math.ceil(D / Math.max(2, Math.floor(size / 44))));
     ctx.fillStyle = '#374151';
     ctx.font = '11px ui-monospace, monospace';
-    for (i = 0; i < L; i += every) {
+    for (i = 0; i < D; i += every) {
       var lbl = String(map ? map[i] : i);
       ctx.textAlign = 'center'; ctx.textBaseline = 'top';
       ctx.fillText(lbl, (i + 0.5) * cell, size + 6);
@@ -398,9 +408,9 @@
       ctx.fillText(lbl, -6, (i + 0.5) * cell);
     }
 
-    cmGeom = { L: L, cell: cell };
-    cmNote = L + ' × ' + L + ' columns'
-      + (marked ? ' · top ' + marked + ' circled (|i-j| ≥ ' + S.minSep + ')' : '')
+    cmGeom = { L: D, cell: cell, back: back, map: map };
+    cmNote = D + ' × ' + D + ' columns'
+      + (back ? ' · ' + (D - L) + ' blank (above the gap threshold)' : '')
       + (vmax > 0 ? ' · white to full colour over 0 – ' + vmax.toFixed(2) : '')
       + ' · axes are input-alignment columns';
     $('cmNote').textContent = cmNote;
@@ -419,10 +429,21 @@
       $('cmNote').textContent = cmNote;
       return;
     }
-    var map = S.ds && S.ds.colMap;
-    $('cmNote').textContent = 'i ' + (map ? map[i] : i) + '   j ' + (map ? map[j] : j)
-      + '   |i-j| ' + Math.abs(i - j)
-      + '   score ' + snap.contact[i * cmGeom.L + j].toFixed(3);
+    /*
+     * i and j are display-frame slots. Report the column numbers from the
+     * frame, but read the score through `back`, since a blank slot has no model
+     * column behind it -- saying so beats printing a 0.000 that looks like a
+     * measured non-contact.
+     */
+    var map = cmGeom.map, gi = map ? map[i] : i, gj = map ? map[j] : j;
+    var back = cmGeom.back;
+    var mi = back ? back[i] : i, mj = back ? back[j] : j;
+    var score = (mi >= 0 && mj >= 0)
+      ? snap.contact[mi * snap.L + mj].toFixed(3)
+      : 'not modelled (gaps above threshold)';
+    $('cmNote').textContent = 'i ' + gi + '   j ' + gj
+      + '   |i-j| ' + Math.abs(gi - gj)
+      + '   score ' + score;
   });
   $('cmCv').addEventListener('mouseleave', function () { $('cmNote').textContent = cmNote; });
 
@@ -437,7 +458,8 @@
     if (!force && now - tblLast < TBL_MS) return;
     tblLast = now;
 
-    var all = UI.rankContacts(snap.contact, snap.L, S.minSep, 0);
+    // separation measured in input-alignment columns, not model columns
+    var all = UI.rankContacts(snap.contact, snap.L, S.minSep, 0, S.ds && S.ds.colMap);
     tblRows = all.slice(0, Math.min(all.length, 3 * snap.L));
 
     var map = S.ds && S.ds.colMap, body = $('tblBody');
@@ -755,7 +777,6 @@
     renderAll();
   });
 
-  $('showTop').addEventListener('change', function (e) { S.showTop = e.target.checked; drawContacts(); });
   $('minSep').value = S.minSep;
   $('minSep').addEventListener('change', function (e) {
     S.minSep = Math.max(1, Math.min(30, Number(e.target.value) || 1));
