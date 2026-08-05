@@ -202,7 +202,38 @@ per-sequence mean.
 
 Checked against [`sokrypton/laxy`
 `examples/gremlin_jax.ipynb`](https://github.com/sokrypton/laxy/blob/main/examples/gremlin_jax.ipynb)
-and GREMLIN_TF v2.1. Its objective is the *sum* over sequences and ours is the
+and GREMLIN_TF v2.1.
+
+The reference writes its objective as a *sum* with a constant penalty:
+
+```python
+lam = 0.01                                  # constant, no explicit normalizer
+if batch_size is not None:
+    lam *= batch_size/N
+    learning_rate = 0.1*log(batch_size)/L
+else:
+    learning_rate = 0.1*log(N)/L
+cce_loss = -(x*log(softmax(logits))).sum([1,2])
+cce_loss *= w                               # w_n = 1/|neighbours at 80%|
+l2_loss  = 0.5*(L-1)*(A-1)*sum(w**2) + sum(b**2)
+loss     = cce_loss.sum() + lam*l2_loss     # SUM over sequences
+```
+
+`N` there is the effective sequence count — the data term is weighted, so its
+scale is `Meff`, and that is the quantity the constant `lam` is implicitly
+divided against. Writing the same objective as a per-sequence mean makes it
+explicit: `λ_w = 0.5·α·(L−1)(A−1)/Meff` and `λ_b = β/Meff`.
+
+`test/core.test.mjs` pins this rather than asserting it — it scores the
+reference's loss directly from the same parameters and compares. On a
+deliberately redundant alignment (`Meff = 32`, `N = 264`, so the two normalizers
+are 8× apart) ours matches reference/Meff to **5e-9** and misses reference/N by
+8×, which is what makes the claim testable at all. The reference's
+`lam *= batch_size/N` is the same bookkeeping in reverse: its data term is a sum,
+so it shrinks with the batch and the penalty must shrink with it, whereas our
+mean is batch-invariant to begin with.
+
+Its objective is therefore the *sum* over sequences and ours is the
 Meff-normalized mean, so ours is exactly theirs divided by Meff — same minimizer,
 and Adam is invariant to the constant.
 
