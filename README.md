@@ -214,12 +214,12 @@ exactly one of them back off:
 
 | | top L/5 | top L/2 | top L |
 | --- | --- | --- | --- |
-| before | 77.4% | 76.6% | 67.1% |
-| **all four changes** | **83.9%** | **80.5%** | **69.0%** |
-| ablate: gaps back in the norm | 83.9% | 76.6% | 67.1% |
-| ablate: bias starts at zero | 80.6% | 79.2% | 66.5% |
-| ablate: old fixed lr 0.05 | 77.4% | 79.2% | 65.8% |
-| ablate: 2× coupling penalty | 80.6% | 76.6% | 69.0% |
+| before | 77.4% | 75.3% | 64.5% |
+| **all four changes** | **80.6%** | **79.2%** | **68.4%** |
+| ablate: gaps back in the norm | 80.6% | 76.6% | 65.8% |
+| ablate: bias starts at zero | 80.6% | 77.9% | 65.8% |
+| ablate: old fixed lr 0.05 | 77.4% | 77.9% | 64.5% |
+| ablate: 2× coupling penalty | 80.6% | 77.9% | 67.7% |
 
 - **Gap state excluded from the contact norm.** The reference takes the
   Frobenius norm over the 20×20 amino-acid block — *"note: we ignore gaps"*.
@@ -235,14 +235,65 @@ exactly one of them back off:
   move the slider.
 
 One deliberate deviation: we zero-sum gauge-fix each block before taking the
-norm; the reference relies on L2 to pin the gauge implicitly. Measured, gauge
-fixing is worth a little, so it stays:
+norm; the reference relies on L2 to pin the gauge implicitly. Re-measured under
+exact Meff reweighting, gauge fixing is **indistinguishable** from the raw norm
+on this benchmark — the top-L column differs by one pair out of 155. It stays
+because it makes the norm gauge-independent by construction rather than by
+trusting L2 to have pinned it, but the earlier claim here that it was "worth a
+little" was reading noise:
 
 | scoring | top L/5 | top L/2 | top L |
 | --- | --- | --- | --- |
-| reference: raw 20×20 norm | 83.9% | 79.2% | 68.4% |
-| **ours: 20×20 + zero-sum gauge** | **83.9%** | **80.5%** | **69.0%** |
-| 21×21 + gauge (gaps in) | 83.9% | 76.6% | 67.1% |
+| reference: raw 20×20 norm | 80.6% | 79.2% | 69.0% |
+| **ours: 20×20 + zero-sum gauge** | **80.6%** | **79.2%** | **68.4%** |
+| 21×21 + gauge (gaps in) | 80.6% | 76.6% | 65.8% |
+| raw 21×21, no gauge | 80.6% | 76.6% | 66.5% |
+
+What the table *does* separate cleanly is excluding gaps from the norm, which is
+worth ~3 points of top-L either way.
+
+### What counts as a contact
+
+Every precision number above is scored against **CB (CA for Gly) < 8 Å, |i−j| ≥
+5** — the CASP convention, and the primary metric here so the numbers stay
+comparable to everyone else's. But that definition is a single distance cutoff
+with no structural context, and it is worth knowing how much it is doing.
+
+The [solab contact page](https://github.com/sokrypton/solab)
+(`assets/js/contact.js`) uses a considered alternative: a residue-residue
+interaction needs the *side chains* pointing at each other, not just backbone
+proximity, so each side chain is approximated by a point projected off the Cα
+trace — along the bisector of the two Cα–Cα bonds, away from the backbone — at a
+per-secondary-structure offset (H 3.0 Å, E 4.0 Å, L 3.5 Å), with a per-SS cutoff
+(8.0 Å helix–helix, 8.5 Å otherwise). It was calibrated there against ConFind
+contact degree > 0.01 over 151 native domains, scoring F1 0.78 versus ~0.3 for a
+raw Cα cutoff. Secondary structure comes from TM-align's Cα-only `make_sec`,
+ported in [`sokrypton/CIRPIN-web`](https://github.com/sokrypton/CIRPIN-web)
+(`src/tmalign.js`) — Cα-only on both sides, so the two agree about what
+information they may use. Both live in [`test/contacts.mjs`](test/contacts.mjs).
+
+Same predictions, three ground truths:
+
+| ground truth | true pairs | top L/5 | top L/2 | top L |
+| --- | --- | --- | --- | --- |
+| CB < 8.0 Å (CASP, primary) | 372 | 80.6% | 79.2% | 68.4% |
+| CB < 8.6 Å (count-matched control) | 464 | 96.8% | 90.9% | 78.7% |
+| solab per-SS virtual-Cβ | 465 | 90.3% | 93.5% | 80.0% |
+
+The middle row is the control, and it is the point. The solab model calls 465
+pairs contacts where CB < 8 Å calls 372, and a more permissive definition raises
+precision for free — so the only fair comparison is against a plain cutoff tuned
+to the same count. Once you do that, **most of the apparent jump is the
+effective cutoff (8.0 → 8.6 Å), not the side-chain projection.** At matched
+count the two trade places: solab is better at top L/2 and top L, worse at top
+L/5, all within a couple of pairs on a single protein.
+
+The honest reading is narrower than "GREMLIN is better than we thought", but not
+nothing: of the top 155 predictions, 24 are pairs solab calls contacts and CB <
+8 Å calls errors, and their CB–CB distances run 8.0–10.0 Å with a median of 8.4.
+Those are just over the line. A 68% top-L against one definition and 80% against
+another, on the same predictions, is mostly a statement about where the line was
+drawn.
 
 ### The GREMLIN_TF optimizer, tested and not adopted
 
@@ -255,9 +306,10 @@ per-element Adam is better at every step count and every learning rate tried:
 
 | optimizer | lr | top L/5 | top L/2 | top L |
 | --- | --- | --- | --- | --- |
-| **Adam (per-element)** | 0.0031 | **83.9%** | **80.5%** | **69.0%** |
-| GREMLIN_TF (scalar vt) | 1.0 | 80.6% | 72.7% | 68.4% |
-| GREMLIN_TF (scalar vt) | 2.0 | 80.6% | 75.3% | 67.7% |
+| **Adam (per-element)** | 0.0031 | **80.6%** | **79.2%** | **68.4%** |
+| GREMLIN_TF (scalar vt) | 0.5 | 80.6% | 72.7% | 65.8% |
+| GREMLIN_TF (scalar vt) | 1.0 | 80.6% | 74.0% | 66.5% |
+| GREMLIN_TF (scalar vt) | 2.0 | 80.6% | 75.3% | 66.5% |
 
 The obvious explanation — that a scalar normalizer suffers from minibatch noise
 in ‖g‖² — turned out to be wrong: repeating at B=1024 kept the same ordering
@@ -447,3 +499,12 @@ node test/bench-loop-order.mjs           # sequence-major vs position-major
 
 Both verify their fast path against the original before timing it, so the
 speedups are like-for-like rather than a different computation.
+
+Every contact-precision number in this README comes from one script, which needs
+two files it does not ship:
+
+```sh
+curl -o af.pdb   https://alphafold.ebi.ac.uk/files/AF-P0A7Y4-F1-model_v6.pdb
+curl -o test.a3m https://alphafold.ebi.ac.uk/files/msa/AF-P0A7Y4-F1-msa_v6.a3m
+node test/eval-precision.mjs .           # ablations, plus all three ground truths
+```
