@@ -24,7 +24,8 @@ node sweep.mjs --arm=alpha                        # 6 proteins x 4 depths x 6 mu
 node sweep.mjs --arm=alphaL --meff=400,1500 \
                --mults=0.125,0.25,0.5,1,2         # length scaling, depth held fixed
 
-node analyse.mjs                                  # read results/*.jsonl
+node analyse.mjs                                  # per-arm curves
+node refit.mjs                                    # pooled fit of the depth exponent
 ```
 
 Slices run in parallel on separate cores, and every run is resumable — results
@@ -60,6 +61,15 @@ masquerade as longer ones. `--meff=<targets>` subsamples each protein to a targe
 Meff first. The row count is solved in closed form from the full-depth weights
 (subsampling by `f` gives `cnt_n -> 1 + f*(cnt_n - 1)`), so it costs nothing, and
 the Meff recorded is the real one measured afterwards.
+
+**Prefer the pooled fit to a row of argmaxes.** `analyse.mjs` shows the curves
+per arm; `refit.mjs` fits the depth exponent from every alpha cell at once, which
+is only legitimate because lr came out flat and `(L-1)(A-1)` came out right, so
+length is not a confounder and cells from different proteins are comparable.
+Regressing through per-row argmaxes gave Meff^-1.85; the pooled fit gives
+Meff^-1.44 with a bootstrap CI of [-1.71, -1.30]. The argmax version was
+overestimating, because on a flat curve it gets pulled to whichever grid point is
+extreme.
 
 **Do not read the argmax on its own.** On a flat surface the argmax is decided
 by a single contact, and an exponent fitted through a row of such argmaxes looks

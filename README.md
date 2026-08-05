@@ -422,27 +422,59 @@ of the same protein. Six proteins, deviation from each protein's own mean:
 | full | 4837 | −1.4 | **+2.2** | +1.3 | +1.2 | −1.0 | −2.4 | | | | ×0.125 |
 
 Every curve turns over inside the grid, so each optimum is bracketed rather than
-resting on an edge. The best multiplier scales as **Meff^−0.85**, which makes the
-optimal penalty **λ_w ∝ Meff^−1.85** against the reference's Meff^−1. A
-multiplier-free cross-check agrees: the absolute λ_w at the optimum swings 1391×
-across a 43× depth range, i.e. Meff^−1.92.
+resting on an edge.
 
-**The shipped default stays at the reference — α = 0.01 with Meff^−1.** Three
-reasons the measurement is not enough to move it:
+**Fitting it properly** ([`refit.mjs`](test/calibration/refit.mjs)). Reading the
+argmax off each row and regressing through those gives Meff^−1.85, and it is an
+overestimate: on curves this flat the argmax is decided by a contact or two, and
+it gets dragged toward whichever grid point is extreme. With the other two
+formulas confirmed — lr flat, `(L−1)(A−1)` right — length stops being a
+confounder and every α measurement can be pooled instead. That is **42 cells
+(protein × depth), 272 fits, 9 proteins, Meff 98–10570, L 70–196**, fitted as one
+model: if `m*(Meff) = C·(Meff/700)^s`, then rescaling each cell's multipliers by
+`s·log₂(Meff/700)` should align every curve on one peak, so grid-search `s` and
+fit a single quadratic with a per-cell intercept. Uncertainty is bootstrapped
+over *proteins*, since cells from one protein share a structure and an alignment
+and are not independent.
+
+```
+m*(Meff) = 0.688 · (Meff/700)^−0.44          95% CI on the exponent [−0.71, −0.30]
+  =>  λ_w ∝ Meff^−1.44                       95% CI [−1.71, −1.30]
+```
+
+The reference's Meff^−1 sits **outside** that interval, so the direction is real.
+But the magnitude is smaller than the argmax suggested, and so is the payoff:
+
+| Meff | fitted m* | gain over the reference |
+| --- | --- | --- |
+| 115 | ×1.52 | +0.2 pt |
+| 451 | ×0.83 | 0.0 pt |
+| 1614 | ×0.48 | +0.5 pt |
+| 4636 | ×0.30 | +1.4 pt |
+| 10570 | ×0.21 | +2.4 pt |
+
+Averaged over the experiment's cells that is **+0.5 points**. It only reaches
+~2 points at the deep end — which, to be fair to it, is where the practical page
+actually lives, since AFDB alignments run 5–15k sequences.
+
+**The shipped default stays at the reference — α = 0.01 with Meff^−1.** The
+effect is statistically supported and still small, and two caveats bite harder
+than the CI does:
 
 - Depth here is a *subsample of a deep family*, not a genuinely shallow family. A
   random 128-sequence slice of a 15k-member family is still drawn from something
   diverse and well-populated; a family that only ever had 128 members is a
   different object, and that is the case a user with a shallow MSA is actually in.
-- Six proteins, all L ≤ 129, at a fixed 400 steps.
-- The gain is real but small — about 2–3 points at each depth extreme and nothing
-  in the middle, where the curves are wide plateaus (at Meff = 382, ×0.5 through
-  ×2 all sit within 2 points of the peak).
+- Fixed 400 steps, one contact definition, E. coli proteins only.
 
-If it ever is adopted, the form should be pinned where α = 0.01 is already right
-rather than silently rescaling everything — `λ_w = 0.5·α·(L−1)(A−1)/Meff ·
-(Meff_ref/Meff)^0.85` with `Meff_ref ≈ 700`, which lands at or within ~1.7 points
-of the peak at all four depths and leaves mid-depth alignments untouched.
+If it is ever adopted, pin it where α = 0.01 is already right rather than
+silently rescaling everything:
+
+```
+λ_w = 0.5·α·(L−1)(A−1)/Meff · (700/Meff)^0.44
+```
+
+which leaves mid-depth alignments untouched and only bends the two ends.
 
 ### The GREMLIN_TF optimizer, tested and not adopted
 
