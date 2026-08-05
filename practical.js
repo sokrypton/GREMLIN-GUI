@@ -322,10 +322,34 @@
       $('cmNote').textContent = '';
       return;
     }
-    var L = snap.L, cm = snap.contact;
+    var L = snap.L, cm = snap.contact, ds = S.ds;
     var size = Math.max(280, Math.min(560, UI.innerW($('cmWrap'), 420) - 44));
     var pad = CM_PAD;
     var ctx = UI.fitCanvas(cv, size + pad + 6, size + pad + 6);
+
+    /*
+     * Scatter the L x L model matrix into the display frame, which puts back the
+     * columns the gap-fraction filter removed. Without this the map silently
+     * closes the holes, so two positions either side of a dropped column are
+     * drawn touching the diagonal as if they were sequential neighbours -- the
+     * one reading of a contact map you never want to get wrong. Dropped rows and
+     * columns stay zero, which the ramp paints blank.
+     *
+     * With the filter off, frameL === L and this is a no-op copy, so nothing
+     * changes in the default view.
+     */
+    var slot = ds && ds.colSlot, D = (ds && ds.frameL) || L;
+    var disp = cm, back = null;
+    if (slot && D > L && slot.length >= L) {
+      disp = new Float32Array(D * D);
+      back = new Int32Array(D).fill(-1);            // frame slot -> model column
+      for (var p = 0; p < L; p++) back[slot[p]] = p;
+      for (var q = 0; q < L; q++) {
+        for (var r2 = 0; r2 < L; r2++) disp[slot[q] * D + slot[r2]] = cm[q * L + r2];
+      }
+    } else {
+      D = L;
+    }
 
     /*
      * Anchor the colour scale at the L-th ranked score rather than at
@@ -349,15 +373,15 @@
 
     // native-resolution paint, scaled up with smoothing off
     var off = document.createElement('canvas');
-    off.width = L; off.height = L;
-    var img = new ImageData(L, L);
-    for (var k = 0; k < L * L; k++) {
-      var c = UI.sequential(cm[k] * inv);
+    off.width = D; off.height = D;
+    var img = new ImageData(D, D);
+    for (var k = 0; k < D * D; k++) {
+      var c = UI.sequential(disp[k] * inv);
       img.data[k * 4] = c[0]; img.data[k * 4 + 1] = c[1]; img.data[k * 4 + 2] = c[2]; img.data[k * 4 + 3] = 255;
     }
     off.getContext('2d').putImageData(img, 0, 0);
     ctx.imageSmoothingEnabled = false;
-    ctx.drawImage(off, 0, 0, L, L, 0, 0, size, size);
+    ctx.drawImage(off, 0, 0, D, D, 0, 0, size, size);
 
     /*
      * No top-L markers. Once the ramp anchors at the L-th ranked score, the top
@@ -366,17 +390,17 @@
      * the rings became the loudest thing on it. The ranked table beside the map
      * gives the exact list when you want it.
      */
-    var cell = size / L;
+    var cell = size / D;
     ctx.strokeStyle = '#111';
     ctx.lineWidth = 1;
     ctx.strokeRect(0.5, 0.5, size - 1, size - 1);
 
-    // ticks in input-alignment numbering
-    var map = S.ds && S.ds.colMap;
-    var every = Math.max(1, Math.ceil(L / Math.max(2, Math.floor(size / 44))));
+    // ticks in input-alignment numbering, over the display frame
+    var map = back ? (ds && ds.frameMap) : (ds && ds.colMap);
+    var every = Math.max(1, Math.ceil(D / Math.max(2, Math.floor(size / 44))));
     ctx.fillStyle = '#374151';
     ctx.font = '11px ui-monospace, monospace';
-    for (i = 0; i < L; i += every) {
+    for (i = 0; i < D; i += every) {
       var lbl = String(map ? map[i] : i);
       ctx.textAlign = 'center'; ctx.textBaseline = 'top';
       ctx.fillText(lbl, (i + 0.5) * cell, size + 6);
@@ -384,8 +408,9 @@
       ctx.fillText(lbl, -6, (i + 0.5) * cell);
     }
 
-    cmGeom = { L: L, cell: cell };
-    cmNote = L + ' × ' + L + ' columns'
+    cmGeom = { L: D, cell: cell, back: back, map: map };
+    cmNote = D + ' × ' + D + ' columns'
+      + (back ? ' · ' + (D - L) + ' blank (above the gap threshold)' : '')
       + (vmax > 0 ? ' · white to full colour over 0 – ' + vmax.toFixed(2) : '')
       + ' · axes are input-alignment columns';
     $('cmNote').textContent = cmNote;
@@ -404,10 +429,21 @@
       $('cmNote').textContent = cmNote;
       return;
     }
-    var map = S.ds && S.ds.colMap;
-    $('cmNote').textContent = 'i ' + (map ? map[i] : i) + '   j ' + (map ? map[j] : j)
-      + '   |i-j| ' + Math.abs(i - j)
-      + '   score ' + snap.contact[i * cmGeom.L + j].toFixed(3);
+    /*
+     * i and j are display-frame slots. Report the column numbers from the
+     * frame, but read the score through `back`, since a blank slot has no model
+     * column behind it -- saying so beats printing a 0.000 that looks like a
+     * measured non-contact.
+     */
+    var map = cmGeom.map, gi = map ? map[i] : i, gj = map ? map[j] : j;
+    var back = cmGeom.back;
+    var mi = back ? back[i] : i, mj = back ? back[j] : j;
+    var score = (mi >= 0 && mj >= 0)
+      ? snap.contact[mi * snap.L + mj].toFixed(3)
+      : 'not modelled (gaps above threshold)';
+    $('cmNote').textContent = 'i ' + gi + '   j ' + gj
+      + '   |i-j| ' + Math.abs(gi - gj)
+      + '   score ' + score;
   });
   $('cmCv').addEventListener('mouseleave', function () { $('cmNote').textContent = cmNote; });
 
@@ -422,7 +458,8 @@
     if (!force && now - tblLast < TBL_MS) return;
     tblLast = now;
 
-    var all = UI.rankContacts(snap.contact, snap.L, S.minSep, 0);
+    // separation measured in input-alignment columns, not model columns
+    var all = UI.rankContacts(snap.contact, snap.L, S.minSep, 0, S.ds && S.ds.colMap);
     tblRows = all.slice(0, Math.min(all.length, 3 * snap.L));
 
     var map = S.ds && S.ds.colMap, body = $('tblBody');

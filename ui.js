@@ -385,11 +385,22 @@
   /* ------------------------------------------------------------------ */
 
   /** Sorted [i, j, score] triples with |i-j| >= minSep, capped at `limit`. */
-  function rankContacts(contact, L, minSep, limit) {
+  /*
+   * `map` is optional: pass a column map and the sequence separation is measured
+   * in the input alignment's numbering rather than in model columns. It matters
+   * whenever a column filter has removed positions, because dropping columns
+   * compresses the model -- two residues 6 apart in the protein can be 4 apart
+   * in the model, and a "min |i-j| >= 5" cut would then throw away a genuinely
+   * long-range pair. Without `map` the two are the same thing.
+   */
+  function rankContacts(contact, L, minSep, limit, map) {
     if (!contact) return [];
     var out = [], i, j;
     for (i = 0; i < L; i++) {
-      for (j = i + minSep; j < L; j++) out.push([i, j, contact[i * L + j]]);
+      for (j = i + 1; j < L; j++) {
+        if ((map ? map[j] - map[i] : j - i) < minSep) continue;
+        out.push([i, j, contact[i * L + j]]);
+      }
     }
     out.sort(function (a, b) { return b[2] - a[2]; });
     return limit ? out.slice(0, Math.min(out.length, limit)) : out;

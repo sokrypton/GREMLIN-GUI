@@ -478,6 +478,35 @@ second copy of what the colour already said — and against a mostly-white map t
 rings became the loudest thing on it. They were softened first and then dropped;
 the ranked table beside the map gives the exact list when you want it.
 
+#### Columns the gap filter removed still take up space
+
+`max column gaps` drops columns the model then never sees, which shrinks L. That
+is fine for fitting and wrong for drawing: closing the holes puts two positions
+either side of a dropped column *adjacent to the diagonal*, which is the one
+reading of a contact map you must not get wrong.
+
+So `buildDataset` returns a display frame as well as the model columns. A column
+dropped because the query has a gap there is not a query position at all and
+never enters the frame; a column dropped by the gap-fraction filter is a query
+position — skipped because too few sequences had a residue there, a fact about
+the alignment rather than the protein — so it keeps its slot and comes back as a
+blank row and column. The `L × L` result is scattered into the frame through
+`colSlot`, hover reports "not modelled" rather than a `0.000` that would read as
+a measured non-contact, and the ticks, table and CSV stay in input-alignment
+numbering throughout.
+
+Sequence separation follows the same rule: `min |i-j|` is measured in input
+columns, not model columns. Compression means two residues 6 apart in the protein
+can be 4 apart in the model, and a model-space cut would silently discard a
+genuinely long-range pair.
+
+On the demo alignment at `max column gaps = 0.3`, L drops 155 → 136 (the removed
+columns are the terminal tails, 0–3 and 140–154) and the map still draws 155 × 155
+with 19 blank. The top-ranked pairs come out at the same input columns as with
+the filter off — 65/118, 85/107, 56/105 — which is the check that the mapping is
+actually carrying through. With the filter off, `frameL === L` and every mapping
+is the identity, so the default view is untouched.
+
 ## Where the remaining headroom is
 
 WASM SIMD collected the ~4× that was available from vectorizing a single thread.

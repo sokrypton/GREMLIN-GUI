@@ -15,6 +15,14 @@ const core = (await import('../gremlin-core.js')).default;
 const MSA = (await import('../msa.js')).default;
 const { Gremlin } = core;
 
+/*
+ * ui.js is a browser IIFE that assigns globalThis.UI -- it touches `document`
+ * only inside the drawing functions, so evaluating it here is enough to reach
+ * the pure index-mapping helpers without a DOM.
+ */
+new Function((await import('node:fs')).readFileSync(new URL('../ui.js', import.meta.url), 'utf8'))();
+const UI = globalThis.UI;
+
 let passed = 0, failed = 0;
 function test(name, fn) {
   try { fn(); console.log('  ok   ' + name); passed++; }
@@ -435,6 +443,56 @@ test("regMode 'gremlin' scales the penalty by (L-1)(A-1)/Meff", () => {
   const ratio = mk('gremlin') / mk('raw');
   const want = (L - 1) * (A - 1) / N;
   assert.ok(Math.abs(ratio - want) < 1e-3, 'ratio ' + ratio + ' != ' + want);
+});
+
+test('gap-filtered columns keep a slot in the display frame', () => {
+  /*
+   * Columns the gap filter drops still have to occupy space in a rendered
+   * result, or the map closes the hole and draws their neighbours adjacent.
+   * Column 1 is mostly gaps here; columns 0, 2, 3 are clean.
+   */
+  const text = '>q\nACDE\n>b\nA-DE\n>c\nA-DE\n>d\nA-DE\n';
+  const ds = MSA.buildDataset(text, { keepQueryColumns: true, maxColGap: 0.5, minCoverage: 0 });
+  assert.equal(ds.L, 3, 'expected column 1 to be dropped, got L=' + ds.L);
+  assert.equal(ds.frameL, 4, 'frame should still span all four query columns');
+  assert.deepEqual([...ds.colMap], [0, 2, 3]);
+  assert.deepEqual([...ds.frameMap], [0, 1, 2, 3]);
+  // model column c is drawn at frame slot colSlot[c], and the two agree on which
+  // input column that is
+  assert.deepEqual([...ds.colSlot], [0, 2, 3]);
+  for (let c = 0; c < ds.L; c++) {
+    assert.equal(ds.frameMap[ds.colSlot[c]], ds.colMap[c],
+      'colSlot and colMap disagree at model column ' + c);
+  }
+  assert.ok(ds.warnings.some(w => /gap threshold/.test(w)), 'no warning about unmodelled columns');
+});
+
+test('with no column filter the display frame is the identity', () => {
+  // the mapping has to vanish in the default view, or it is a source of bugs
+  const sim = MSA.synthetic({ L: 16, N: 80, A: 6, nPairs: 2, seed: 12 });
+  const ds = MSA.buildDataset(sim.text, {});
+  assert.equal(ds.frameL, ds.L);
+  assert.deepEqual([...ds.colSlot], [...Array(ds.L).keys()]);
+  assert.deepEqual([...ds.frameMap], [...ds.colMap]);
+});
+
+test('rankContacts measures separation in input columns when given a map', () => {
+  // model columns 0,1,2 <- input columns 0,5,6. Pair (0,1) is 5 apart in the
+  // input and 1 apart in the model, so a minSep of 5 must keep it.
+  const L = 3;
+  const cm = new Float32Array(L * L);
+  cm[0 * L + 1] = 0.9;          // input separation 5
+  cm[1 * L + 2] = 0.8;          // input separation 1
+  cm[0 * L + 2] = 0.7;          // input separation 6
+  const map = Int32Array.from([0, 5, 6]);
+
+  const modelSpace = UI.rankContacts(cm, L, 5, 0);
+  assert.equal(modelSpace.length, 0, 'no pair is 5 apart in model columns');
+
+  const inputSpace = UI.rankContacts(cm, L, 5, 0, map);
+  assert.deepEqual(inputSpace.map(r => [r[0], r[1]]), [[0, 1], [0, 2]],
+    'expected the two pairs that are >= 5 apart in input columns');
+  assert.equal(inputSpace[0][2].toFixed(3), '0.900');
 });
 
 test('column gap filter works and reports what it kept', () => {

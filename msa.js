@@ -315,23 +315,47 @@
 
     var rawN = raw.length, rawL = Lraw;
 
-    /* ---- column selection ---- */
-    var cols = [];
+    /*
+     * ---- column selection ----
+     *
+     * Two lists come out of this, not one, because the two column filters mean
+     * different things to a reader of the results.
+     *
+     *   cols   the columns the model actually sees. Length L.
+     *   frame  the columns a result should be *displayed* over. Length frameL.
+     *
+     * A column dropped because the query has a gap there is not a query
+     * position at all, so it has nothing to say in query numbering and never
+     * enters the frame. A column dropped by the gap-fraction filter IS a query
+     * position -- it was skipped because too few sequences had a residue there,
+     * which is a statement about the alignment, not about the protein. Leaving
+     * it out entirely makes its two neighbours look adjacent in the contact map
+     * when they are not, so it keeps its slot in the frame and comes back as a
+     * blank row and column.
+     *
+     * colSlot[c] is where model column c sits in the frame. With the gap filter
+     * off, frame === cols and colSlot is the identity, so nothing changes.
+     */
+    var cols = [], frame = [], slot = [];
     var c2, gapCount, want;
     for (c2 = 0; c2 < Lraw; c2++) {
-      if (!digit) {
-        if (keepQuery && raw[0][c2] === '-') continue;
-        if (maxColGap < 1) {
-          gapCount = 0;
-          for (n = 0; n < rawN; n++) if (raw[n][c2] === '-') gapCount++;
-          if (gapCount / rawN > maxColGap) continue;
-        }
+      if (!digit && keepQuery && raw[0][c2] === '-') continue;
+      frame.push(c2);
+      if (!digit && maxColGap < 1) {
+        gapCount = 0;
+        for (n = 0; n < rawN; n++) if (raw[n][c2] === '-') gapCount++;
+        if (gapCount / rawN > maxColGap) continue;      // keeps its frame slot
       }
+      slot.push(frame.length - 1);
       cols.push(c2);
     }
     if (!cols.length) throw new Error('Column filters removed every column.');
     if (cols.length < Lraw) {
       warnings.push('Kept ' + cols.length + ' of ' + Lraw + ' columns.');
+    }
+    if (frame.length > cols.length) {
+      warnings.push((frame.length - cols.length) + ' column(s) exceeded the gap threshold and are '
+        + 'not modelled; they are shown blank in the contact map and skipped in the ranked list.');
     }
 
     /* ---- sequence selection (py2Dmol pipeline: coverage, then identity) ---- */
@@ -426,6 +450,10 @@
       seqs: seqs,
       redundancy: redundancy,
       colMap: Int32Array.from(cols),
+      // display frame -- see the column-selection comment above
+      frameL: frame.length,
+      frameMap: Int32Array.from(frame),
+      colSlot: Int32Array.from(slot),
       names: keepSeq.map(function (k) { return names[k] || ('seq' + k); }),
       cov: Float32Array.from(keepSeq, function (k) { return covs[k]; }),
       idn: Float32Array.from(keepSeq, function (k) { return idns[k]; }),
