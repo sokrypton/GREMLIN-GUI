@@ -28,6 +28,7 @@
  * Usage (see ./README.md; run fetch-data.sh first):
  *   node sweep.mjs --arm=lr
  *   node sweep.mjs --arm=alpha --depths=128,512,2048,0 --mults=0.125,0.25,0.5,1,2
+ *   node sweep.mjs --arm=alphaL --meff=400,1500          # length scaling, depth held fixed
  *   node sweep.mjs --arm=alpha --slice=0 --nslice=3      # run slices in parallel
  *
  * Appends JSON lines to results/<arm>.jsonl, skipping cells already present, so
@@ -57,7 +58,7 @@ const MINSEP = 5;
 
 const manifest = JSON.parse(readFileSync(HERE + 'manifest.json', 'utf8'));
 const ACCS = opt('proteins', '') ? opt('proteins', '').split(',')
-                                 : manifest[ARM === 'lr' ? 'length' : 'depth'];
+                                 : (manifest[ARM] || manifest[ARM === 'lr' ? 'length' : 'depth']);
 const MULTS = opt('mults', ARM === 'lr' ? '0.25,0.5,1,2,4' : '0.0625,0.125,0.25,0.5,1,2')
   .split(',').map(Number);
 // 0 means "no subsampling"; the lr arm only ever runs at full depth
@@ -79,6 +80,39 @@ function load(acc) {
   });
   cache[acc] = { ds, isC: cbContacts(parsePdb(readFileSync(pdbf, 'utf8')), 8.0) };
   return cache[acc];
+}
+
+/*
+ * How many rows to keep so that Meff lands near `target`.
+ *
+ * Needed for the length arm: the coupling penalty carries BOTH (L-1)(A-1) and
+ * 1/Meff, so sweeping alpha across proteins of different length only measures
+ * the length scaling if depth is held fixed. Deeper alignments would otherwise
+ * masquerade as longer ones.
+ *
+ * Subsampling by a factor f thins each sequence's neighbourhood, so its
+ * neighbour count goes from cnt_n to about 1 + f*(cnt_n - 1) and
+ *   Meff(f) ~ f * sum_n 1/(1 + f*(cnt_n - 1)).
+ * cnt_n is just 1/sw_n from the full-depth model, so this is a closed form and
+ * the bisection costs nothing -- no model is built per probe. It only picks the
+ * row count; the Meff actually recorded is the real one measured afterwards.
+ */
+function rowsForMeff(ds, sw, target) {
+  const N = ds.N;
+  const cnt = new Float64Array(N);
+  for (let n = 0; n < N; n++) cnt[n] = 1 / sw[n];
+  const est = (f) => {
+    let s = 0;
+    for (let n = 0; n < N; n++) s += 1 / (1 + f * (cnt[n] - 1));
+    return f * s;
+  };
+  if (est(1) <= target) return 0;                 // not deep enough; use it all
+  let lo = 1 / N, hi = 1;
+  for (let it = 0; it < 40; it++) {
+    const mid = Math.sqrt(lo * hi);
+    if (est(mid) < target) lo = mid; else hi = mid;
+  }
+  return Math.max(8, Math.round(Math.sqrt(lo * hi) * N));
 }
 
 /* Deterministic subsample, query pinned first. rows <= 0 means keep everything. */
@@ -131,8 +165,36 @@ if (existsSync(OUT)) {
   }
 }
 
+/*
+ * The length arm targets a Meff instead of a row count, so proteins of
+ * different length are compared at matched depth. Row counts are resolved
+ * lazily, since it needs each protein's full-depth weights.
+ */
+const MEFFS = opt('meff', '') ? opt('meff', '').split(',').map(Number) : null;
+const fullSw = {};        // full-depth sequence weights, one pass per protein
+async function rowsFor(acc, target) {
+  const { ds } = load(acc);
+  if (!fullSw[acc]) {
+    const wasm = await core.initWasm(WASM);
+    // built only for its reweighting pass; the parameters are never touched,
+    // and it is dropped straight after so the allocation does not accumulate
+    const probe = new Gremlin({
+      L: ds.L, A: ds.A, N: ds.N, seqs: ds.seqs, backend: wasm,
+      identity: 0.8, seed: 1, cfg: { batch: 8 }
+    });
+    fullSw[acc] = Float32Array.from(probe.sw);
+  }
+  return rowsForMeff(ds, fullSw[acc], target);
+}
+
 const JOBS = [];
-for (const acc of ACCS) for (const rows of DEPTHS) for (const m of MULTS) JOBS.push({ acc, rows, m });
+if (MEFFS) {
+  for (const acc of ACCS) for (const target of MEFFS) for (const m of MULTS) {
+    JOBS.push({ acc, target, rows: -1, m });
+  }
+} else {
+  for (const acc of ACCS) for (const rows of DEPTHS) for (const m of MULTS) JOBS.push({ acc, rows, m });
+}
 const mine = JOBS.filter((_, i) => i % NSLICE === SLICE);
 process.stderr.write('arm=' + ARM + ' slice ' + SLICE + '/' + NSLICE
   + ': ' + mine.length + ' cells, ' + done.size + ' already done\n');
@@ -140,10 +202,11 @@ process.stderr.write('arm=' + ARM + ' slice ' + SLICE + '/' + NSLICE
 let i = 0;
 for (const job of mine) {
   i++;
-  const key = [job.acc, job.rows, job.m].join('/');
+  const key = [job.acc, job.target === undefined ? job.rows : 'M' + job.target, job.m].join('/');
   if (done.has(key)) continue;
   const { ds, isC } = load(job.acc);
-  const sub = subsample(ds, job.rows, 99);
+  const rows = job.target === undefined ? job.rows : await rowsFor(job.acc, job.target);
+  const sub = subsample(ds, rows, 99);
   const lrMult = ARM === 'lr' ? job.m : 1;
   const aMult = ARM === 'lr' ? 1 : job.m;
 
@@ -163,7 +226,8 @@ for (const job of mine) {
     at[ck] = precision(g.contactMap(), ds.L, ds.colMap, isC);
   }
   appendFileSync(OUT, JSON.stringify({
-    key, acc: job.acc, arm: ARM, lrMult, aMult, rows: job.rows,
+    key, acc: job.acc, arm: ARM, lrMult, aMult, rows,
+    target: job.target === undefined ? null : job.target,
     L: ds.L, N: sub.N, Meff: g.Meff, at, secs: (Date.now() - t0) / 1000
   }) + '\n');
   process.stderr.write('[' + i + '/' + mine.length + '] ' + key

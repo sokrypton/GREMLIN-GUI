@@ -2,5 +2,6 @@
   "_comment": "length: 12 naturally-different proteins, 70-270 residues, all deeper than 8k so depth does not confound the length axis. Ordered by L so a partial run already spans it. depth: six proteins at L<=129, cheap enough to sweep several depths x several multipliers inside an hour.",
   "length": ["P0A9X9", "P0A6A8", "P0A6F9", "P0AG59", "P0A7R5", "P0AA25",
              "P0AE67", "P0A7Y4", "P0A7B8", "P0A805", "P0A9K9", "P0AEZ3"],
-  "depth": ["P0A9X9", "P0A6A8", "P0A6F9", "P0AG59", "P0AA25", "P0AE67"]
+  "depth": ["P0A9X9", "P0A6A8", "P0A6F9", "P0AG59", "P0AA25", "P0AE67"],
+  "alphaL": ["P0A9X9", "P0A6A8", "P0A6F9", "P0AA25", "P0AE67", "P0A7Y4", "P0A7B8", "P0A9K9"]
 }
