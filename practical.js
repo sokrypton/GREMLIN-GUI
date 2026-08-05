@@ -252,13 +252,39 @@
     rng.addEventListener('input', function () {
       host[f[2]] = Number(rng.value);
       lab.textContent = f[3](host[f[2]]);
+      refreshApply();
     });
   });
   [['cQuery', 'keepQueryColumns'], ['cSort', 'sortByIdentity'], ['cDedup', 'dedup']].forEach(function (p) {
     var cb = $(p[0]);
     cb.checked = !!S.prep[p[1]];
-    cb.addEventListener('change', function () { S.prep[p[1]] = cb.checked; });
+    cb.addEventListener('change', function () { S.prep[p[1]] = cb.checked; refreshApply(); });
   });
+
+  /*
+   * Filters are applied on load and again on every click, so the button is not
+   * really an action you have to remember -- its job is to tell you whether the
+   * controls in front of you still describe the alignment below. It greys out
+   * and reads "Filters applied" while they match, and comes back the moment a
+   * control moves. Without that there is no way to tell a filter you set from
+   * one you set and applied, which is the actual confusion.
+   *
+   * maxIdentity belongs in the key even though the worker applies it rather
+   * than buildDataset: from the user's side it is one of the same knobs.
+   */
+  var appliedKey = null;
+  function filterKey() {
+    return [S.prep.minCoverage, S.prep.minIdentity, S.prep.maxColGap,
+            S.prep.keepQueryColumns, S.prep.sortByIdentity, S.prep.dedup,
+            S.maxIdentity].join('|');
+  }
+  function refreshApply() {
+    var btn = $('apply');
+    var loaded = S.text !== null;
+    var clean = loaded && appliedKey === filterKey();
+    btn.disabled = !loaded || clean;
+    btn.textContent = clean ? 'Filters applied' : 'Apply filters';
+  }
 
   /* ---------------------------------------------------------------- */
   /* MSA panel                                                        */
@@ -459,6 +485,7 @@
 
     $('err').hidden = !S.err;
     if (S.err) $('err').textContent = S.err;
+    refreshApply();
 
     setStat('N', ds ? UI.fmtInt(ds.N) : '-');
     setStat('L', ds ? ds.L : '-');
@@ -649,6 +676,7 @@
     }
 
     S.ds = ds;
+    appliedKey = filterKey();          // the controls now describe what is loaded
     S.sel = 0;
     S.snap = null;
     S.info = null;
