@@ -1,0 +1,2 @@
+# ~40MB of AlphaFold models and alignments; fetch-data.sh pulls them on demand
+data/
