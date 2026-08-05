@@ -32,7 +32,6 @@
     err: null,
     sel: 0,
     minSep: 5,
-    showTop: true,
     maxRate: 0,             // real alignments never hit a display cap; run flat out
     /*
      * batch 128 rather than 256: the Adam update is O(L^2 A^2) and independent
@@ -138,7 +137,6 @@
       <h2>Contact map</h2>
       <div class="note mono">APC(L2norm(gauge-fixed <span class="w">w</span>))</div>
       <div class="row" style="margin-bottom:10px">
-        <label class="cb"><input type="checkbox" id="showTop" checked> mark top L</label>
         <label class="small">min |i-j| <input type="number" id="minSep" min="1" max="30"></label>
       </div>
       <div id="cmWrap"><canvas id="cmCv" class="clickable"></canvas></div>
@@ -361,26 +359,14 @@
     ctx.imageSmoothingEnabled = false;
     ctx.drawImage(off, 0, 0, L, L, 0, 0, size, size);
 
-    var cell = size / L, marked = 0, t, r;
-    // Nothing is ranked in a freshly reset model: every score is 0, so "top L"
-    // would just circle the first L pairs in index order.
-    if (S.showTop && tblRows.length && tblRows[0][2] > 0) {
-      /*
-       * Recessive on purpose. These annotate the map, they do not carry it --
-       * the ramp already makes the top pairs the darkest cells, so a saturated
-       * marker here would just shout over the thing it is pointing at. Wide
-       * enough to read as a ring around the cell rather than a filled dot,
-       * which at cell ~3.5px it otherwise does.
-       */
-      ctx.strokeStyle = 'rgba(5,150,105,0.7)';
-      ctx.lineWidth = Math.max(0.75, Math.min(1.25, cell / 4));
-      marked = Math.min(L, tblRows.length);
-      for (t = 0; t < marked; t++) {
-        r = Math.max(2.2, cell * 0.62);
-        ctx.beginPath(); ctx.arc((tblRows[t][1] + 0.5) * cell, (tblRows[t][0] + 0.5) * cell, r, 0, 6.2832); ctx.stroke();
-        ctx.beginPath(); ctx.arc((tblRows[t][0] + 0.5) * cell, (tblRows[t][1] + 0.5) * cell, r, 0, 6.2832); ctx.stroke();
-      }
-    }
+    /*
+     * No top-L markers. Once the ramp anchors at the L-th ranked score, the top
+     * L pairs ARE the darkest cells, so circling them drew a second copy of
+     * information the colour already carried -- and against a mostly-white map
+     * the rings became the loudest thing on it. The ranked table beside the map
+     * gives the exact list when you want it.
+     */
+    var cell = size / L;
     ctx.strokeStyle = '#111';
     ctx.lineWidth = 1;
     ctx.strokeRect(0.5, 0.5, size - 1, size - 1);
@@ -400,7 +386,6 @@
 
     cmGeom = { L: L, cell: cell };
     cmNote = L + ' × ' + L + ' columns'
-      + (marked ? ' · top ' + marked + ' circled (|i-j| ≥ ' + S.minSep + ')' : '')
       + (vmax > 0 ? ' · white to full colour over 0 – ' + vmax.toFixed(2) : '')
       + ' · axes are input-alignment columns';
     $('cmNote').textContent = cmNote;
@@ -755,7 +740,6 @@
     renderAll();
   });
 
-  $('showTop').addEventListener('change', function (e) { S.showTop = e.target.checked; drawContacts(); });
   $('minSep').value = S.minSep;
   $('minSep').addEventListener('change', function (e) {
     S.minSep = Math.max(1, Math.min(30, Number(e.target.value) || 1));

@@ -472,10 +472,11 @@ Two numbers set the ramp, and both were measured rather than eyeballed:
   the real arcs. At γ = 1.6 the same cell paints at 0.11 and the
   secondary-structure arcs are the first thing you see.
 
-The top-L markers were then made recessive (thinner, 0.7 alpha, wide enough to
-read as a ring rather than a filled dot at ~3.5px cells). Once the ramp works,
-the darkest cells *are* the top pairs, so a saturated marker only shouts over
-what it is pointing at.
+The top-L markers are gone, and the ramp is why. Anchoring at the L-th ranked
+score means the top L pairs *are* the darkest cells, so circling them drew a
+second copy of what the colour already said — and against a mostly-white map the
+rings became the loudest thing on it. They were softened first and then dropped;
+the ranked table beside the map gives the exact list when you want it.
 
 ## Where the remaining headroom is
 
