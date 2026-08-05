@@ -248,10 +248,26 @@
       g.append(sv('text', { x: 8, y: mid + 6, 'font-size': 16, 'text-anchor': 'start' }, String(i)));
     }
 
+    /*
+     * Every coupling is drawn twice, once per direction.
+     *
+     * W is symmetric -- W[i,a,j,b] === W[j,i,b,a] -- so one coupling feeds two
+     * conditionals: it pushes x'(j,b) given input x(i,a), and equally pushes
+     * x'(i,a) given input x(j,b). topCouplings enumerates the i<j half only,
+     * since storing both would be redundant, so the mirror has to be added back
+     * here or half the network goes missing. The original looped over all
+     * ordered pairs and got both for free.
+     *
+     * Ranking is unaffected: the two copies have identical |w|, so the top-K
+     * cut lands in the same place either way.
+     */
     // weakest first, so strong couplings draw on top
     var t = snap.top, lines = [], k, u;
     if (t) {
-      for (k = 0; k < t.length; k += 5) lines.push([t[k], t[k + 1], t[k + 2], t[k + 3], t[k + 4]]);
+      for (k = 0; k < t.length; k += 5) {
+        lines.push([t[k], t[k + 1], t[k + 2], t[k + 3], t[k + 4]]);
+        lines.push([t[k + 2], t[k + 3], t[k], t[k + 1], t[k + 4]]);
+      }
       lines.sort(function (p, q) { return Math.abs(p[4]) - Math.abs(q[4]); });
       for (k = 0; k < lines.length; k++) {
         u = lines[k][4] / HEAT_SCALE;

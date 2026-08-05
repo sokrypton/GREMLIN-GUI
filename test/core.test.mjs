@@ -184,6 +184,45 @@ test('loss history is bounded and keeps its full span', () => {
   assert.equal(h[0], 0, 'history lost the origin');
 });
 
+test('topCouplings returns each pair once, so callers must mirror it', () => {
+  /*
+   * The educational network diagram lost half its lines to exactly this: W is
+   * symmetric, topCouplings therefore enumerates only i<j, and one coupling
+   * feeds two conditionals. A caller drawing one line per quintuple draws half
+   * the network. Pin the contract so the next reader sees it.
+   */
+  const sim = MSA.synthetic({ L: 4, N: 60, A: 4, nPairs: 2, seed: 3 });
+  const ds = MSA.buildDataset(sim.text, {});
+  const g = new Gremlin({
+    L: ds.L, A: ds.A, N: ds.N, seqs: ds.seqs, uniformWeights: true,
+    cfg: { batch: ds.N, lr: 0.1, alpha: 0.01, beta: 0.01 }
+  });
+  for (let s = 0; s < 50; s++) g.step();
+
+  const L = g.L, A = g.A, all = (L * (L - 1) / 2) * A * A;
+  const t = g.topCouplings(all * 2);            // ask for more than exist
+  assert.equal(t.length / 5, all, 'expected the i<j half only, got ' + (t.length / 5));
+
+  for (let k = 0; k < t.length; k += 5) {
+    const [i, a, j, b, w] = [t[k], t[k + 1], t[k + 2], t[k + 3], t[k + 4]];
+    assert.ok(i < j, 'quintuple is not upper-triangular: ' + i + ',' + j);
+    // the mirror is never returned, but it exists in W with the same value --
+    // which is what makes drawing both directions correct
+    const mirror = g.W[((j * L + i) * A + a) * A + b];
+    assert.equal(mirror, w, 'W[' + j + ',' + i + '] != W[' + i + ',' + j + ']');
+  }
+
+  // mirroring covers every ordered pair exactly once
+  const seen = new Set();
+  for (let k = 0; k < t.length; k += 5) {
+    seen.add([t[k], t[k + 1], t[k + 2], t[k + 3]].join(','));
+    seen.add([t[k + 2], t[k + 3], t[k], t[k + 1]].join(','));
+  }
+  assert.equal(seen.size, 2 * all, 'mirroring did not cover every ordered pair');
+  console.log('       L=' + L + ' A=' + A + ': ' + all + ' quintuples -> '
+            + (2 * all) + ' directed couplings (what the diagram draws)');
+});
+
 /* ------------------------------------------------------------------ */
 section('3. contact recovery on planted couplings');
 
