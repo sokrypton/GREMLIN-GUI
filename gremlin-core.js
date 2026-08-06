@@ -1202,6 +1202,39 @@
     return out;
   };
 
+  /*
+   * The same A x A block after zero-sum gauge fixing over the non-gap states,
+   * indexed [a*A + b] with the gap row/column left at zero.
+   *
+   * This is the block the contact score is actually computed from: contactMap
+   * subtracts the row mean, the column mean and the grand mean before taking the
+   * Frobenius norm, over nA states (gap excluded). Showing the raw block instead
+   * would show the gauge freedom too -- a constant can be added to any row and
+   * removed from the column without changing the model, so raw entries are not
+   * comparable between pairs and the eye reads that arbitrariness as signal.
+   */
+  Gremlin.prototype.blockGauged = function (i, j) {
+    var L = this.L, A = this.A, AA = this.AA, W = this.W, nA = this.normA;
+    var out = new Float32Array(AA);
+    if (i === j || i < 0 || j < 0 || i >= L || j >= L) return out;
+    var o = (i * L + j) * AA, a, bq, w;
+    var rowM = new Float64Array(A), colM = new Float64Array(A), all = 0;
+    for (bq = 0; bq < nA; bq++) {
+      for (a = 0; a < nA; a++) {
+        w = W[o + bq * A + a];
+        rowM[a] += w; colM[bq] += w; all += w;
+      }
+    }
+    for (a = 0; a < nA; a++) { rowM[a] /= nA; colM[a] /= nA; }
+    all /= nA * nA;
+    for (bq = 0; bq < nA; bq++) {
+      for (a = 0; a < nA; a++) {
+        out[a * A + bq] = W[o + bq * A + a] - rowM[a] - colM[bq] + all;
+      }
+    }
+    return out;
+  };
+
   /** The A x A coupling block for a position pair, indexed [a*A + b]. */
   Gremlin.prototype.block = function (i, j) {
     var L = this.L, A = this.A, AA = this.AA, W = this.W;
@@ -1692,8 +1725,17 @@
           if (model) { model.sel = d.sel | 0; if (!running) await snapshot(false); }
         } else if (m === 'block') {
           if (model) {
-            var blk = await model.blockAsync(d.i | 0, d.j | 0);
-            post({ type: 'block', i: d.i | 0, j: d.j | 0, A: model.A, data: blk }, [blk.buffer]);
+            var blk;
+            if (d.gauged) {
+              // blockGauged reads W on the CPU, so a GPU run has to mirror first
+              var okSync = await model.syncParams();
+              blk = okSync ? model.blockGauged(d.i | 0, d.j | 0)
+                           : new Float32Array(model.AA);
+            } else {
+              blk = await model.blockAsync(d.i | 0, d.j | 0);
+            }
+            post({ type: 'block', i: d.i | 0, j: d.j | 0, A: model.A,
+                   gauged: !!d.gauged, gap: model.gap, data: blk }, [blk.buffer]);
           }
         } else if (m === 'contacts') {
           if (model) {

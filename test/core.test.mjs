@@ -192,6 +192,180 @@ test('loss history is bounded and keeps its full span', () => {
   assert.equal(h[0], 0, 'history lost the origin');
 });
 
+test('blockGauged is zero-sum and matches the contact score it feeds', () => {
+  /*
+   * The popup shows blockGauged, so it has to be the block the score is
+   * actually computed from, not merely something similar. Two checks:
+   * every row and column of the non-gap sub-block sums to zero (that IS the
+   * zero-sum gauge), and its Frobenius norm reproduces the pre-APC score that
+   * contactMap builds from. Showing the raw block instead would display the
+   * gauge freedom -- a constant can move between a row and a column without
+   * changing the model -- as though it were signal.
+   */
+  const sim = MSA.synthetic({ L: 14, N: 300, A: 21, nPairs: 3, seed: 44 });
+  const ds = MSA.buildDataset(sim.text, {});
+  const g = new Gremlin({
+    L: ds.L, A: ds.A, N: ds.N, seqs: ds.seqs, gap: 20, biasInit: 'freq',
+    uniformWeights: true, seed: 3,
+    cfg: { batch: ds.N, lr: 0.05, alpha: 0.01, beta: 0.01, regMode: 'gremlin' }
+  });
+  for (let s = 0; s < 60; s++) g.step();
+  const L = g.L, A = g.A, nA = g.normA;
+  assert.equal(nA, A - 1, 'expected the gap to be excluded from the norm');
+
+  let worstSum = 0, worstSym = 0;
+  for (const [i, j] of [[0, 5], [3, 9], [7, 13]]) {
+    const blk = g.blockGauged(i, j);
+    for (let a = 0; a < nA; a++) {
+      let rs = 0, cs = 0;
+      for (let b = 0; b < nA; b++) { rs += blk[a * A + b]; cs += blk[b * A + a]; }
+      worstSum = Math.max(worstSum, Math.abs(rs), Math.abs(cs));
+    }
+    // the gap row and column are left untouched at zero
+    for (let a = 0; a < A; a++) {
+      assert.equal(blk[a * A + (A - 1)], 0, 'gap column is not zero');
+      assert.equal(blk[(A - 1) * A + a], 0, 'gap row is not zero');
+    }
+    // transposing the pair transposes the block
+    const flip = g.blockGauged(j, i);
+    for (let a = 0; a < nA; a++) for (let b = 0; b < nA; b++) {
+      worstSym = Math.max(worstSym, Math.abs(blk[a * A + b] - flip[b * A + a]));
+    }
+  }
+  assert.ok(worstSum < 2e-5, 'rows/columns do not sum to zero: ' + worstSum);
+  assert.ok(worstSym < 1e-6, 'blockGauged(i,j) is not the transpose of (j,i): ' + worstSym);
+
+  /* Frobenius norm of the gauged block == the raw score behind the contact map.
+     contactMap returns post-APC, so undo APC to recover the raw matrix. */
+  const cm = g.contactMap();
+  const raw = new Float64Array(L * L);
+  for (let i = 0; i < L; i++) for (let j = 0; j < L; j++) {
+    if (i === j) continue;
+    const blk = g.blockGauged(i, j);
+    let s = 0;
+    for (let a = 0; a < nA; a++) for (let b = 0; b < nA; b++) s += blk[a * A + b] * blk[a * A + b];
+    raw[i * L + j] = Math.sqrt(s);
+  }
+  let tot = 0;
+  const rsum = new Float64Array(L), csum = new Float64Array(L);
+  for (let i = 0; i < L; i++) for (let j = 0; j < L; j++) {
+    rsum[i] += raw[i * L + j]; csum[j] += raw[i * L + j]; tot += raw[i * L + j];
+  }
+  let worst = 0;
+  for (let i = 0; i < L; i++) for (let j = i + 1; j < L; j++) {
+    const apc = raw[i * L + j] - rsum[i] * csum[j] / tot;
+    worst = Math.max(worst, Math.abs(apc - cm[i * L + j]));
+  }
+  console.log('       zero-sum residual ' + worstSum.toExponential(1)
+            + ', APC agreement ' + worst.toExponential(1));
+  assert.ok(worst < 1e-4, 'blockGauged does not reproduce the contact score: ' + worst);
+});
+
+test('our objective is the reference objective divided by Meff', () => {
+  /*
+   * The reference (gremlin_jax.ipynb) writes a SUM with a constant penalty:
+   *   cce = -(x*log(softmax(logits))).sum([1,2]);  cce *= w_n
+   *   l2  = 0.5*(L-1)*(A-1)*sum(W^2) + sum(b^2)
+   *   loss = cce.sum() + lam*l2                     lam = 0.01
+   * Its normalizer is the effective sequence count, so the per-sequence-mean
+   * form we use has lam/Meff. The alignment here is deliberately redundant --
+   * Meff far below N -- because on a non-redundant one Meff == N and the test
+   * cannot tell the two normalizers apart, which is exactly how a wrong
+   * normalizer would slip through.
+   */
+  const AB = 'ACDEFGHIKLMNPQRSTVWY';
+  let s = 4;
+  const rnd = () => (s = (s * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+  const rows = [];
+  for (let f = 0; f < 12; f++) {
+    const base = [];
+    for (let k = 0; k < 18; k++) base.push(AB[(rnd() * 20) | 0]);
+    for (let c = 0; c < 22; c++) {
+      const v = base.slice();
+      for (let m = 0; m < 2; m++) v[(rnd() * 18) | 0] = AB[(rnd() * 20) | 0];
+      rows.push('>f' + f + '_' + c + '\n' + v.join(''));
+    }
+  }
+  const ds = MSA.buildDataset(rows.join('\n') + '\n', {});
+  const L = ds.L, A = ds.A, N = ds.N, LAM = 0.01;
+  const g = new Gremlin({
+    L, A, N, seqs: ds.seqs, gap: 20, biasInit: 'freq', identity: 0.8, seed: 5,
+    cfg: { batch: N, lr: 0.01, alpha: LAM, beta: LAM, regMode: 'gremlin' }
+  });
+  assert.ok(g.Meff < 0.3 * N, 'fixture is not redundant enough to separate Meff from N');
+
+  let st = 99;
+  const r2 = () => ((st = (st * 1664525 + 1013904223) >>> 0) / 4294967296 - 0.5);
+  for (let i = 0; i < L; i++) for (let j = i + 1; j < L; j++)
+    for (let p = 0; p < A; p++) for (let q = 0; q < A; q++) {
+      const c = r2() * 0.3;
+      g.W[((i * L + j) * A + q) * A + p] = c;
+      g.W[((j * L + i) * A + p) * A + q] = c;
+    }
+  for (let k = 0; k < L * A; k++) g.b[k] += r2() * 0.2;
+
+  // step() reports the loss for the parameters BEFORE it updates them, so score
+  // a snapshot; comparing against the post-update arrays compares two models
+  const W = Float32Array.from(g.W), b = Float32Array.from(g.b);
+  g.step();
+
+  let cce = 0;
+  for (let n = 0; n < N; n++) {
+    let ce = 0;
+    for (let i = 0; i < L; i++) {
+      const lo = new Float64Array(A);
+      for (let a = 0; a < A; a++) lo[a] = b[i * A + a];
+      for (let j = 0; j < L; j++) {
+        if (j === i) continue;
+        const o = ((i * L + j) * A + ds.seqs[n * L + j]) * A;
+        for (let a = 0; a < A; a++) lo[a] += W[o + a];
+      }
+      let mx = -Infinity;
+      for (let a = 0; a < A; a++) if (lo[a] > mx) mx = lo[a];
+      let z = 0;
+      for (let a = 0; a < A; a++) z += Math.exp(lo[a] - mx);
+      ce += -(lo[ds.seqs[n * L + i]] - mx - Math.log(z));
+    }
+    cce += g.sw[n] * ce;
+  }
+  let sw2 = 0, sb2 = 0;
+  for (let k = 0; k < g.P; k++) sw2 += W[k] * W[k];
+  for (let k = 0; k < L * A; k++) sb2 += b[k] * b[k];
+  const ref = cce + LAM * (0.5 * (L - 1) * (A - 1) * sw2 + sb2);
+
+  const relMeff = Math.abs(g.loss - ref / g.Meff) / Math.abs(ref / g.Meff);
+  const relN = Math.abs(g.loss - ref / N) / Math.abs(ref / N);
+  console.log('       N=' + N + ' Meff=' + g.Meff.toFixed(1)
+            + '   vs ref/Meff: ' + relMeff.toExponential(1)
+            + '   vs ref/N: ' + relN.toExponential(1));
+  assert.ok(relMeff < 1e-6, 'ours is not the reference divided by Meff: ' + relMeff);
+  assert.ok(relN > 1e-2, 'the fixture cannot distinguish Meff from N');
+});
+
+test('the penalty-to-data ratio does not depend on batch size', () => {
+  // the reference keeps this fixed with lam *= batch_size/N because its data
+  // term is a sum; ours is a mean, so it should already hold with no correction
+  const sim = MSA.synthetic({ L: 12, N: 400, A: 8, nPairs: 2, seed: 31 });
+  const ds = MSA.buildDataset(sim.text, {});
+  let ratio = null;
+  for (const B of [16, 64, 400]) {
+    const g = new Gremlin({
+      L: ds.L, A: ds.A, N: ds.N, seqs: ds.seqs, gap: 20, biasInit: 'freq',
+      identity: 0.8, seed: 5,
+      cfg: { batch: B, lr: 0.01, alpha: 0.01, beta: 0.01, regMode: 'gremlin' }
+    });
+    for (let k = 0; k < g.P; k++) g.W[k] = 0.01;
+    g.step();
+    let sw2 = 0;
+    for (let k = 0; k < g.P; k++) sw2 += 0.01 * 0.01;
+    const lam = g.regW / sw2;
+    if (ratio === null) ratio = lam;
+    assert.ok(Math.abs(lam - ratio) / ratio < 1e-6,
+      'lambda_w moved with batch size: B=' + B + ' gave ' + lam + ' not ' + ratio);
+  }
+  console.log('       lambda_w identical at B = 16, 64, 400 (full)');
+});
+
 test('topCouplings returns each pair once, so callers must mirror it', () => {
   /*
    * The educational network diagram lost half its lines to exactly this: W is

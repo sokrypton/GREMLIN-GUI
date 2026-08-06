@@ -202,7 +202,38 @@ per-sequence mean.
 
 Checked against [`sokrypton/laxy`
 `examples/gremlin_jax.ipynb`](https://github.com/sokrypton/laxy/blob/main/examples/gremlin_jax.ipynb)
-and GREMLIN_TF v2.1. Its objective is the *sum* over sequences and ours is the
+and GREMLIN_TF v2.1.
+
+The reference writes its objective as a *sum* with a constant penalty:
+
+```python
+lam = 0.01                                  # constant, no explicit normalizer
+if batch_size is not None:
+    lam *= batch_size/N
+    learning_rate = 0.1*log(batch_size)/L
+else:
+    learning_rate = 0.1*log(N)/L
+cce_loss = -(x*log(softmax(logits))).sum([1,2])
+cce_loss *= w                               # w_n = 1/|neighbours at 80%|
+l2_loss  = 0.5*(L-1)*(A-1)*sum(w**2) + sum(b**2)
+loss     = cce_loss.sum() + lam*l2_loss     # SUM over sequences
+```
+
+`N` there is the effective sequence count — the data term is weighted, so its
+scale is `Meff`, and that is the quantity the constant `lam` is implicitly
+divided against. Writing the same objective as a per-sequence mean makes it
+explicit: `λ_w = 0.5·α·(L−1)(A−1)/Meff` and `λ_b = β/Meff`.
+
+`test/core.test.mjs` pins this rather than asserting it — it scores the
+reference's loss directly from the same parameters and compares. On a
+deliberately redundant alignment (`Meff = 32`, `N = 264`, so the two normalizers
+are 8× apart) ours matches reference/Meff to **5e-9** and misses reference/N by
+8×, which is what makes the claim testable at all. The reference's
+`lam *= batch_size/N` is the same bookkeeping in reverse: its data term is a sum,
+so it shrinks with the batch and the penalty must shrink with it, whereas our
+mean is batch-invariant to begin with.
+
+Its objective is therefore the *sum* over sequences and ours is the
 Meff-normalized mean, so ours is exactly theirs divided by Meff — same minimizer,
 and Adam is invariant to the constant.
 
@@ -229,10 +260,13 @@ exactly one of them back off:
   out already explaining column composition.
 - **The coupling penalty carries a 0.5.** Ours was 2× the reference at the same
   α.
-- **Learning rate `0.1·log(batch)/L`.** It has to shrink with L because the
-  pseudo-likelihood sums L conditionals per sequence; a rate tuned at L=48
-  overshoots at L=155. The practical page adopts this automatically until you
-  move the slider.
+- **Learning rate `0.1·log(batch)/L`.** The pseudo-likelihood sums L conditionals
+  per sequence, so a rate tuned at L=48 overshoots at L=155 — the ablation row
+  above is a fixed 0.05, which is 16× the formula at L=155. The practical page
+  adopts the formula automatically until you move the slider. But see
+  [below](#does-the-calibration-hold-across-length-and-depth): a 12-protein sweep
+  finds the optimum is a *broad basin*, so this row is about not being far wrong
+  rather than about the `1/L` exponent being finely tuned.
 
 One deliberate deviation: we zero-sum gauge-fix each block before taking the
 norm; the reference relies on L2 to pin the gauge implicitly. Re-measured under
@@ -294,6 +328,182 @@ nothing: of the top 155 predictions, 24 are pairs solab calls contacts and CB <
 Those are just over the line. A 68% top-L against one definition and 80% against
 another, on the same predictions, is mostly a statement about where the line was
 drawn.
+
+### Does the calibration hold across length and depth?
+
+Everything above was scored on one protein. The reference's settings were tuned
+across many, and its two length/depth-aware formulas are exactly the kind of
+thing a single protein cannot check:
+
+```
+lr    = 0.1·log(B)/L                 shrinks with length
+λ_w   = 0.5·α·(L−1)(A−1)/Meff        grows with length, falls with depth
+```
+
+So both were swept as a **multiplier** over 12 proteins (L = 70–270, AlphaFold DB
+models plus the alignments those models were built from). A calibrated formula
+has its best multiplier at ~1 everywhere; a drifting optimum means the exponent
+is off. Each protein is its own control — baselines run 67% to 89% top-L/2, so
+comparing raw numbers across proteins would drown the effect. Harness in
+[`test/calibration/`](test/calibration/).
+
+**Length varies by using different proteins, not by cropping.** Cropping is the
+obvious design and it does not work: a crop is not a shorter protein, it is an
+amputated fragment. Most of each residue's contact partners fall outside the
+window, so the conditional for column *i* loses most of its true predictors and
+the structure has almost nothing left to score against. A 40-column crop of
+P0A9B2 left **13 true contacts among 630 pairs** — top-L/2 is then 4 hits out of
+20 — against 372 among 11,935 for a whole protein at L=155. At that resolution a
+16× change in lr is invisible.
+
+#### lr: a broad basin, and the formula sits in it
+
+Deviation from each protein's own mean, in points:
+
+| group | n | ×0.25 | ×0.5 | ×1 | ×2 | ×4 |
+| --- | --- | --- | --- | --- | --- | --- |
+| all | 12 | −0.9±1.3 | +0.0±0.6 | −0.2±0.4 | +0.9±0.9 | +0.1±0.8 |
+| L < 120 | 6 | +0.1±1.9 | +0.7±0.3 | −0.4±0.7 | +0.3±1.2 | −0.7±1.0 |
+| L 120–190 | 4 | +0.3±0.5 | +0.5±0.2 | −0.1±0.3 | −0.1±0.3 | −0.6±0.2 |
+| L ≥ 190 | 2 | −6.0±5.0 | −3.3±3.3 | +0.3±1.3 | +4.7±3.6 | +4.3±3.3 |
+
+A **16× range in lr moves top-L/2 by about a point**, and the peak is 1.1 s.e.
+from the formula — not distinguishable. Nothing here beats `0.1·log(B)/L`, which
+is the useful result: the formula is confirmed, and there is no tuning left to
+do. It also bounds what the `1/L` term is worth. Over L = 70–270 the formula
+itself only spans 3.8×, well inside a ±4× basin, so a single constant rate would
+also have sat in the basin at every length tested. The `1/L` exponent earns its
+place over a wider length range than this sweep covers, not within it.
+
+#### α and length: `(L−1)(A−1)` is right
+
+`λ_w` carries two scalings, so sweeping α across proteins of different length
+only measures the length one if depth is held fixed — otherwise a deeper
+alignment reads as a longer one. Depth is pinned by subsampling each protein to
+a target Meff. Subsampling by *f* thins every neighbourhood, so
+`cnt_n → 1 + f(cnt_n − 1)` and `Meff(f) ≈ f·Σ 1/(1 + f(cnt_n − 1))`; since
+`cnt_n = 1/sw_n` from one full-depth pass, the row count that hits a target is
+closed-form. It is not a small correction — reaching Meff ≈ 450 takes 744 rows at
+L=70 and 856 at L=176.
+
+Eight proteins, L = 70–196, at two matched depths:
+
+| target Meff | short (L<120) peak | long (L≥120) peak | |
+| --- | --- | --- | --- |
+| 400 | ×1 | ×1 | identical |
+| 1500 | ×0.125 | ×0.25 | adjacent, differ by 0.6pt at 1.0 s.e. |
+
+**No length dependence survives**, so the `(L−1)(A−1)` factor already carries it
+and there is nothing for a multiplier to fix. Per-protein argmaxes do wander
+(one protein peaks at ×0.125 for one target and ×2 for the other) but those
+curves are flat and the argmax is decided by a contact or two — the bin curves
+are the statistic that means something here.
+
+This also settles an earlier confusion. At full depth the short proteins looked
+like they wanted ×0.125 and the long ones ×0.5, which would have implied the
+length factor was under-correcting. That was depth leaking through: those long
+proteins sat at lower Meff (P0A7B8 at 2025 against up to 8465 for the short
+ones). With depth matched, the split disappears.
+
+And it de-confounds the depth result below. The optimum still moves with depth at
+fixed length — ×1 at Meff 400 down to ~×0.2 at Meff 1500 — so that effect is
+depth, not length wearing a disguise.
+
+#### α and depth: the reference's `1/Meff` under-corrects, but we keep it
+
+Depth is varied by subsampling, which genuinely does give a shallower alignment
+of the same protein. Six proteins, deviation from each protein's own mean:
+
+| depth | Meff | ×0.0625 | ×0.125 | ×0.25 | ×0.5 | ×1 | ×2 | ×4 | ×8 | ×16 | peak |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 128 seqs | 111 | −4.9 | −1.6 | −0.6 | +0.6 | +1.1 | +2.6 | **+2.9** | +1.2 | −1.4 | ×4 |
+| 512 | 382 | −6.0 | −2.2 | +2.1 | +3.1 | **+5.0** | +4.9 | +2.1 | −2.6 | −6.4 | ×1 |
+| 2048 | 1158 | −3.4 | +0.7 | +0.3 | +0.5 | **+2.1** | −0.2 | | | | ×1 |
+| full | 4837 | −1.4 | **+2.2** | +1.3 | +1.2 | −1.0 | −2.4 | | | | ×0.125 |
+
+Every curve turns over inside the grid, so each optimum is bracketed rather than
+resting on an edge.
+
+**Fitting it properly** ([`refit.mjs`](test/calibration/refit.mjs)). Reading the
+argmax off each row and regressing through those gives Meff^−1.85, and it is an
+overestimate: on curves this flat the argmax is decided by a contact or two, and
+it gets dragged toward whichever grid point is extreme. With the other two
+formulas confirmed — lr flat, `(L−1)(A−1)` right — length stops being a
+confounder and every α measurement can be pooled instead. That is **42 cells
+(protein × depth), 272 fits, 9 proteins, Meff 98–10570, L 70–196**, fitted as one
+model: if `m*(Meff) = C·(Meff/700)^s`, then rescaling each cell's multipliers by
+`s·log₂(Meff/700)` should align every curve on one peak, so grid-search `s` and
+fit a single quadratic with a per-cell intercept. Uncertainty is bootstrapped
+over *proteins*, since cells from one protein share a structure and an alignment
+and are not independent.
+
+```
+m*(Meff) = 0.688 · (Meff/700)^−0.44          95% CI on the exponent [−0.71, −0.30]
+  =>  λ_w ∝ Meff^−1.44                       95% CI [−1.71, −1.30]
+```
+
+The reference's Meff^−1 sits **outside** that interval, so the direction is real.
+But the magnitude is smaller than the argmax suggested, and so is the payoff:
+
+| Meff | fitted m* | gain over the reference |
+| --- | --- | --- |
+| 115 | ×1.52 | +0.2 pt |
+| 451 | ×0.83 | 0.0 pt |
+| 1614 | ×0.48 | +0.5 pt |
+| 4636 | ×0.30 | +1.4 pt |
+| 10570 | ×0.21 | +2.4 pt |
+
+Averaged over the experiment's cells that is +0.5 points, reaching ~2 points at
+the deep end. **Those numbers are predictions, not measurements** — they come
+from evaluating the fitted parabola at its own vertex against the same parabola
+at ×1, on the data the parabola was fitted to.
+
+#### It does not survive a holdout
+
+So the formulas were run head to head on **15 proteins fetched after the
+exponent was fitted** (L 75–179, 11–16k deep, zero overlap with any fitting arm),
+paired by protein × depth — same subsample, same seed, same step count, only α
+differs. `expo` is the corrected exponent `(700/Meff)^0.44`; `full` is the fitted
+optimum, which also drops α by 0.688 at the pin.
+
+Paired difference against the reference, in points (n = 30 cells):
+
+| metric | ref | expo − ref | full − ref |
+| --- | --- | --- | --- |
+| top L/5 | 67.9 | +0.30 ± 0.50 (7W/4L) | +0.25 ± 0.57 (8W/7L) |
+| top L/2 | 54.8 | +0.26 ± 0.25 (10W/6L) | +0.64 ± 0.30 (13W/5L) |
+| top L | 43.2 | **−0.46 ± 0.25** (6W/16L) | −0.37 ± 0.31 (12W/16L) |
+
+At full depth alone, where the fit predicted +1.4 to +2.4 points, the measured
+difference is +0.17 ± 0.35 on top L/2 and **−0.52 ± 0.42 on top L** (3W/9L).
+The predicted gain does not appear, and top-L gets slightly worse.
+
+The reason is visible in where the fit's evidence sat: only **5 of 40 fitted
+cells** were above Meff 4000 — one apiece at 5910, 8465 and 10570 — so the whole
+predicted gain lived in the thinnest part of the data, and the holdout's
+full-depth Meff tops out at 5863 (median 3716). An exponent whose confidence
+interval excludes Meff^−1 and a formula that predicts better on new proteins are
+different claims. The first held; the second did not.
+
+**The shipped default stays at the reference — α = 0.01 with Meff^−1** — and now
+for a measured reason rather than a cautious one. Two caveats also still apply to
+the in-sample effect:
+
+- Depth here is a *subsample of a deep family*, not a genuinely shallow family. A
+  random 128-sequence slice of a 15k-member family is still drawn from something
+  diverse and well-populated; a family that only ever had 128 members is a
+  different object, and that is the case a user with a shallow MSA is actually in.
+- Fixed 400 steps, one contact definition, E. coli proteins only.
+
+The form that was on the table, had the holdout gone the other way, was
+`λ_w = 0.5·α·(L−1)(A−1)/Meff · (700/Meff)^0.44` — pinned at Meff ≈ 700 so
+mid-depth alignments stay untouched and only the two ends bend. It is recorded
+here because the in-sample effect is reproducible and someone will find it again;
+what is also recorded is that it bought nothing on 15 proteins it had not seen.
+
+The whole α investigation is a worked example of the difference between an effect
+that is real in a sample and one that transfers. It survived a bracketing check,
+a length-confound check and a bootstrap, and still did not generalize.
 
 ### The GREMLIN_TF optimizer, tested and not adopted
 

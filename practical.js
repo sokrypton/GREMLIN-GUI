@@ -164,6 +164,24 @@
       </div>
     </div>
   </div>
+
+  <div class="modal" id="blkModal" hidden>
+    <div class="modal-box">
+      <div class="modal-head">
+        <h2 id="blkTitle"></h2>
+        <button class="small" id="blkClose">close</button>
+      </div>
+      <div class="note mono">A&times;A block of <span class="w">w</span>, the term the contact score norms</div>
+      <label class="small">order
+        <select id="blkOrder">
+          <option value="chem">biochemistry</option>
+          <option value="alpha">alphabetical</option>
+        </select>
+      </label>
+      <canvas id="blkCv"></canvas>
+      <div class="tiny" id="blkNote"></div>
+    </div>
+  </div>
 </div>`;
 
   /* ---------------------------------------------------------------- */
@@ -448,6 +466,184 @@
   $('cmCv').addEventListener('mouseleave', function () { $('cmNote').textContent = cmNote; });
 
   /* ---------------------------------------------------------------- */
+  /* coupling block popup                                             */
+  /* ---------------------------------------------------------------- */
+
+  /*
+   * The contact map collapses each position pair to one number -- the Frobenius
+   * norm of its A x A coupling block. This shows the block that number came
+   * from, so "why is this pair scored high" has an answer beyond the score.
+   *
+   * Diverging red/white/blue here, deliberately unlike the contact map's
+   * sequential ramp: a coupling is signed. Negative means the two residues
+   * co-occur less than independence predicts, and collapsing that to a
+   * magnitude is exactly what the norm already did.
+   *
+   * The block is requested per click rather than shipped with each snapshot --
+   * W never crosses the worker boundary, and at L=155 the full tensor is 42MB.
+   */
+  /*
+   * Amino-acid orderings for the block axes.
+   *
+   * The alphabet order the model stores states in (ARNDCQEGHILKMFPSTWYV) is an
+   * indexing convention, not a meaningful axis: it scatters chemically similar
+   * residues, so a coupling pattern that is really "this position likes small
+   * hydrophobics opposite an acid" shows up as speckle. Grouping by chemistry
+   * puts those cells next to each other, and the group rules below draw the
+   * boundaries so the blocks are readable as blocks.
+   */
+  var AA_ORDER = {
+    chem: {
+      label: 'biochemistry',
+      groups: [['A', 'V', 'L', 'I', 'M'], ['F', 'Y', 'W'], ['G', 'P', 'C'],
+               ['S', 'T', 'N', 'Q'], ['D', 'E'], ['K', 'R', 'H']],
+      names: ['aliphatic', 'aromatic', 'special', 'polar', 'acidic', 'basic']
+    },
+    alpha: { label: 'alphabetical', groups: null, names: null }
+  };
+
+  var blkState = { i: -1, j: -1, score: 0, order: 'chem', msg: null };
+
+  /*
+   * Display slot -> model state index, plus where the group rules fall.
+   * Any symbol the ordering does not mention (digit mode, an unusual alphabet)
+   * is appended in its natural order rather than dropped, so the panel never
+   * silently hides a state.
+   */
+  function blockOrder(symbols, nA, mode) {
+    var spec = AA_ORDER[mode] || AA_ORDER.alpha;
+    var perm = [], rules = [], seen = {};
+    if (spec.groups) {
+      spec.groups.forEach(function (grp) {
+        grp.forEach(function (sym) {
+          var k = symbols.indexOf(sym);
+          if (k >= 0 && k < nA && !seen[k]) { perm.push(k); seen[k] = 1; }
+        });
+        if (perm.length) rules.push(perm.length);
+      });
+    }
+    for (var k = 0; k < nA; k++) if (!seen[k]) perm.push(k);
+    rules.pop();                                  // no rule after the last group
+    return { perm: perm, rules: rules, names: spec.names };
+  }
+
+  function openBlock(i, j, score) {
+    // keep the chosen ordering across opens; replacing the whole object here
+    // silently dropped it and fell back to alphabetical
+    blkState = { i: i, j: j, score: score, order: blkState.order, msg: null };
+    $('blkModal').hidden = false;
+    var map = S.ds && S.ds.colMap;
+    $('blkTitle').textContent = 'Couplings  ' + (map ? map[i] : i) + ' ↔ ' + (map ? map[j] : j);
+    $('blkNote').textContent = 'loading…';
+    UI.fitCanvas($('blkCv'), 1, 1);
+    send({ type: 'block', i: i, j: j, gauged: true });
+  }
+  function closeBlock() { $('blkModal').hidden = true; blkState.i = -1; }
+
+  function drawBlock(msg) {
+    if (msg.i !== blkState.i || msg.j !== blkState.j) return;   // a stale reply
+    blkState.msg = msg;
+    renderBlock();
+  }
+
+  function renderBlock() {
+    var msg = blkState.msg, ds = S.ds;
+    if (!msg || !ds) return;
+    var A = msg.A, data = msg.data;
+    // the norm ignores gaps, so the panel does too -- 20x20, not 21x21
+    var nA = (msg.gap === A - 1) ? A - 1 : A;
+    var syms = ds.symbols;
+    var ord = blockOrder(syms, nA, blkState.order);
+    var perm = ord.perm;
+
+    // room on the left and top for the residue letters plus an axis title
+    var cell = 20, padL = 46, padT = 44, padR = 10, padB = 10;
+    var size = nA * cell;
+    var ctx = UI.fitCanvas($('blkCv'), size + padL + padR, size + padT + padB);
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, size + padL + padR, size + padT + padB);
+    ctx.translate(padL, padT);
+
+    var vmax = 0, a, b, v;
+    for (a = 0; a < nA; a++) for (b = 0; b < nA; b++) {
+      v = Math.abs(data[perm[a] * A + perm[b]]);
+      if (v > vmax) vmax = v;
+    }
+    var inv = vmax > 0 ? 1 / vmax : 0;
+    for (a = 0; a < nA; a++) {
+      for (b = 0; b < nA; b++) {
+        ctx.fillStyle = UI.divCss(data[perm[a] * A + perm[b]] * inv);
+        ctx.fillRect(b * cell, a * cell, cell, cell);
+      }
+    }
+    // faint per-cell grid, then heavier rules between chemical groups
+    ctx.strokeStyle = '#e5e7eb';
+    ctx.lineWidth = 1;
+    var p;
+    for (a = 0; a <= nA; a++) {
+      p = Math.round(a * cell) + 0.5;
+      ctx.beginPath(); ctx.moveTo(p, 0); ctx.lineTo(p, size); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, p); ctx.lineTo(size, p); ctx.stroke();
+    }
+    ctx.strokeStyle = '#9ca3af';
+    ctx.lineWidth = 1.5;
+    (ord.rules || []).forEach(function (r) {
+      p = Math.round(r * cell) + 0.5;
+      ctx.beginPath(); ctx.moveTo(p, 0); ctx.lineTo(p, size); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, p); ctx.lineTo(size, p); ctx.stroke();
+    });
+    ctx.strokeStyle = '#111';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(0.5, 0.5, size - 1, size - 1);
+
+    ctx.fillStyle = '#374151';
+    ctx.font = '11px ui-monospace, monospace';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
+    for (b = 0; b < nA; b++) ctx.fillText(syms[perm[b]] || '?', (b + 0.5) * cell, -6);
+    ctx.textAlign = 'end'; ctx.textBaseline = 'middle';
+    for (a = 0; a < nA; a++) ctx.fillText(syms[perm[a]] || '?', -6, (a + 0.5) * cell);
+
+    /* axis titles: which position each side is, in input-alignment numbering */
+    var mapc = ds.colMap;
+    var ci = mapc ? mapc[blkState.i] : blkState.i;
+    var cj = mapc ? mapc[blkState.j] : blkState.j;
+    ctx.fillStyle = '#111';
+    ctx.font = '600 12px ui-sans-serif, system-ui, sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
+    ctx.fillText('j = column ' + cj, size / 2, -22);
+    ctx.save();
+    ctx.translate(-30, size / 2);
+    ctx.rotate(-Math.PI / 2);
+    ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
+    ctx.fillText('i = column ' + ci, 0, 0);
+    ctx.restore();
+
+    // strongest few entries, which is usually the thing worth reading off
+    var top = [];
+    for (a = 0; a < nA; a++) for (b = 0; b < nA; b++) top.push([a, b, data[a * A + b]]);
+    top.sort(function (q, r) { return Math.abs(r[2]) - Math.abs(q[2]); });
+    var best = top.slice(0, 4).map(function (t) {
+      return (syms[t[0]] || '?') + (syms[t[1]] || '?') + ' ' + t[2].toFixed(3);
+    }).join('   ');
+    $('blkNote').innerHTML = 'zero-sum gauge, gaps excluded · ±' + vmax.toFixed(3)
+      + ' full scale · contact score ' + blkState.score.toFixed(3)
+      + (ord.names ? '<br>groups: ' + ord.names.join(' · ') : '')
+      + '<br>strongest: ' + best;
+  }
+
+  $('blkOrder').addEventListener('change', function (e) {
+    blkState.order = e.target.value;
+    renderBlock();                       // reorders in place; no refetch needed
+  });
+  $('blkClose').addEventListener('click', closeBlock);
+  $('blkModal').addEventListener('click', function (e) {
+    if (e.target === $('blkModal')) closeBlock();      // click the backdrop
+  });
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && !$('blkModal').hidden) closeBlock();
+  });
+
+  /* ---------------------------------------------------------------- */
   /* ranked contacts                                                  */
   /* ---------------------------------------------------------------- */
 
@@ -466,8 +662,12 @@
     body.innerHTML = '';
     tblRows.slice(0, 20).forEach(function (r, k) {
       var tr = document.createElement('tr');
+      tr.className = 'clickrow';
+      tr.title = 'show the coupling matrix for this pair';
       tr.innerHTML = '<td class="dim">' + (k + 1) + '</td><td>' + (map ? map[r[0]] : r[0])
         + '</td><td>' + (map ? map[r[1]] : r[1]) + '</td><td class="r">' + r[2].toFixed(3) + '</td>';
+      // r[0]/r[1] are MODEL columns; the popup re-labels them for display
+      tr.addEventListener('click', function () { openBlock(r[0], r[1], r[2]); });
       body.append(tr);
     });
     $('tblNote').textContent = 'top 20 of ' + all.length + ' pairs, |i-j| ≥ ' + S.minSep;
@@ -662,6 +862,8 @@
       } else if (d.type === 'snapshot') {
         S.snap = UI.mergeSnap(S.snap, d);
         S.running = d.running;
+      } else if (d.type === 'block') {
+        drawBlock(d);
       } else if (d.type === 'error') {
         S.err = d.message;
         S.running = false;

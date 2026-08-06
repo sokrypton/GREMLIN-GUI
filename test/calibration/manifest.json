@@ -1,0 +1,52 @@
+{
+  "_comment": "length: 12 naturally-different proteins, 70-270 residues, all deeper than 8k so depth does not confound the length axis. Ordered by L so a partial run already spans it. depth: six proteins at L<=129, cheap enough to sweep several depths x several multipliers inside an hour. holdout: 15 proteins fetched AFTER the alpha exponent was fitted and used in none of the fitting arms, for the head-to-head in holdout.mjs.",
+  "length": [
+    "P0A9X9",
+    "P0A6A8",
+    "P0A6F9",
+    "P0AG59",
+    "P0A7R5",
+    "P0AA25",
+    "P0AE67",
+    "P0A7Y4",
+    "P0A7B8",
+    "P0A805",
+    "P0A9K9",
+    "P0AEZ3"
+  ],
+  "depth": [
+    "P0A9X9",
+    "P0A6A8",
+    "P0A6F9",
+    "P0AG59",
+    "P0AA25",
+    "P0AE67"
+  ],
+  "alphaL": [
+    "P0A9X9",
+    "P0A6A8",
+    "P0A6F9",
+    "P0AA25",
+    "P0AE67",
+    "P0A7Y4",
+    "P0A7B8",
+    "P0A9K9"
+  ],
+  "holdout": [
+    "P0A7T7",
+    "P0A7T3",
+    "P0A7U7",
+    "P0A7U3",
+    "P0A7K6",
+    "P0A7L3",
+    "P0A7K2",
+    "P0ADY3",
+    "P0A7S3",
+    "P0A7W7",
+    "P0A7X3",
+    "P0A7J7",
+    "P0AA10",
+    "P0A7W1",
+    "P62399"
+  ]
+}
