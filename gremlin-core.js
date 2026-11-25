@@ -107,16 +107,32 @@
     this.base = this.memory.buffer;
   };
 
-  /* Bump-allocate a view. Called only between reserve() and first use. */
+  /*
+   * Hand the whole heap back. The worker calls this before building each new
+   * model: it only ever holds one, and without it every re-init (new alignment,
+   * new filter settings) stacked another 4*P floats on top of the last until
+   * wasm32's 4GB ceiling.
+   */
+  WasmBackend.prototype.release = function () { this.ptr = this.x.heap_base(); };
+
+  /*
+   * Bump-allocate a view. Called only between reserve() and first use. Views are
+   * zeroed: after release() the bytes belong to the previous model, and stale
+   * Adam moments there would silently steer the new one.
+   */
   WasmBackend.prototype.f32 = function (n) {
     var p = this.ptr;
     this.ptr += n * 4;
-    return { p: p, v: new Float32Array(this.base, p, n) };
+    var v = new Float32Array(this.base, p, n);
+    v.fill(0);
+    return { p: p, v: v };
   };
   WasmBackend.prototype.i32 = function (n) {
     var p = this.ptr;
     this.ptr += n * 4;
-    return { p: p, v: new Int32Array(this.base, p, n) };
+    var v = new Int32Array(this.base, p, n);
+    v.fill(0);
+    return { p: p, v: v };
   };
   /* Bytes, optionally aligned -- meff_counts wants 16-byte aligned rows so its
      v128 loads never straddle one. Allocate these last: the bump pointer is
@@ -125,7 +141,9 @@
     if (align) this.ptr = (this.ptr + align - 1) & ~(align - 1);
     var p = this.ptr;
     this.ptr += n;
-    return { p: p, v: new Uint8Array(this.base, p, n) };
+    var v = new Uint8Array(this.base, p, n);
+    v.fill(0);
+    return { p: p, v: v };
   };
 
   /*
@@ -204,7 +222,8 @@
      */
     var LA = this.L * this.A;
     var bk = opts.backend || null;
-    var be = bk && bk.name === 'wasm' ? bk : null;
+    // data_pass keeps a row of logits in at most six f32x4 registers
+    var be = bk && bk.name === 'wasm' && this.A <= 24 ? bk : null;
     this.wasm = be;
     this.gpu = bk && bk.name === 'webgpu' ? bk : null;
 
@@ -220,7 +239,9 @@
 
     if (be) {
       var scratchN = Math.max(2 * this.A, this.L);
-      var floats = 4 * this.P + 4 * LA + Bmax * this.A + scratchN
+      // Li rows are padded to a whole number of f32x4 lanes for data_pass
+      var LS = (this.A + 3) & ~3;
+      var floats = 4 * this.P + 4 * LA + Bmax * LS + 4 + scratchN
                  + this.L * this.L + 2 * LA + Bmax
                  + this.N;                        // meff neighbour counts
       var ints = this.N * this.L + Bmax;
@@ -232,7 +253,7 @@
       var g = be.f32(this.P); this.G = g.v; this.pG = g.p;
       var m = be.f32(this.P); this.M = m.v; this.pM = m.p;
       var v = be.f32(this.P); this.V = v.v; this.pV = v.p;
-      var bb = be.f32(LA); this.b = bb.v; this.pb = bb.p;
+      var bb = be.f32(LA + 4); this.b = bb.v.subarray(0, LA); this.pb = bb.p;   // +4: data_pass reads whole vectors
       var gb = be.f32(LA); this.Gb = gb.v; this.pGb = gb.p;
       var mb = be.f32(LA); this.Mb = mb.v; this.pMb = mb.p;
       var vb = be.f32(LA); this.Vb = vb.v; this.pVb = vb.p;
@@ -242,7 +263,7 @@
       var pr = be.f32(LA); this.prBuf = pr.v; this.pPr = pr.p;
       var sq = be.i32(this.N * this.L); this.seqs = sq.v; this.pSeqs = sq.p;
       this.seqs.set(opts.seqs);
-      var li = be.f32(Bmax * this.A); this.Li = li.v; this.pLi = li.p;
+      var li = be.f32(Bmax * LS); this.Li = li.v; this.pLi = li.p;
       var ba = be.i32(Bmax); this.batch = ba.v; this.pBatch = ba.p;
       var cf = be.f32(Bmax); this.coef = cf.v; this.pCoef = cf.p;
       var mc = be.f32(this.N); this.mCnt = mc.v; this.pMCnt = mc.p;
@@ -639,8 +660,9 @@
       this.pll = this.wasm.x.data_pass(
         this.pW, this.pG, this.pb, this.pGb, this.pLi,
         this.pSeqs, this.pBatch, this.pCoef, L, A, B);
-      this._symmetrize();
-      this._adam();
+      // per-element Adam fuses with symmetrize (see sym_adam in gremlin.c)
+      if (this.cfg.optMode !== 'gremlin') { this._adam(true); }
+      else { this._symmetrize(); this._adam(); }
       this.steps++;
       return this.loss;
     }
@@ -727,7 +749,7 @@
 
   /* Fused in-place Adam + L2. One pass, zero allocation, and the L2 sums come
      out for free -- the original allocated six full-size arrays per step. */
-  Gremlin.prototype._adam = function () {
+  Gremlin.prototype._adam = function (fusedSym) {
     var cfg = this.cfg, lr = cfg.lr, b1 = cfg.b1, b2 = cfg.b2, eps = cfg.eps;
     var W = this.W, G = this.G, M = this.M, V = this.V, P = this.P;
     var k, w, g, m, v;
@@ -795,7 +817,10 @@
       return;
     }
 
-    if (this.wasm) {
+    if (this.wasm && fusedSym) {
+      sw2 = this.wasm.x.sym_adam(this.pW, this.pG, this.pM, this.pV, this.L, this.A,
+                                 lr, b1, b2, eps, ibc1, ibc2, gW);
+    } else if (this.wasm) {
       sw2 = this.wasm.x.adam(this.pW, this.pG, this.pM, this.pV, P,
                              lr, b1, b2, eps, ibc1, ibc2, gW);
     } else {
@@ -1670,6 +1695,8 @@
           }
 
           post({ type: 'progress', phase: 'weights', frac: 0 });
+          model = null;
+          if (backend && backend.release) backend.release();   // one model at a time
           model = new Gremlin({
             L: d.L, A: d.A, N: nSeq, seqs: seqs, cfg: d.cfg,
             uniformWeights: d.uniformWeights, backend: backend,

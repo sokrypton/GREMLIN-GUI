@@ -34,7 +34,7 @@ numerics are testable without a browser:
 
 ```sh
 node test/core.test.mjs        # numerics, MSA parsing, cost model  (26 tests)
-node test/backends.test.mjs    # WASM + the self-test gate          (21 tests)
+node test/backends.test.mjs    # WASM + the self-test gate          (25 tests)
 node test/wgsl.test.mjs        # WGSL validation (needs naga; skips if absent)
 node test/eval-precision.mjs   # contact precision vs an AlphaFold structure
 ```
@@ -52,6 +52,7 @@ target; `gremlin.wasm` is committed so users never have to):
 
 ```sh
 ./build-wasm.sh
+CLANG=/opt/homebrew/opt/llvm/bin/clang ./build-wasm.sh   # Apple's clang has no wasm32 target
 ```
 
 ## Getting an alignment
@@ -541,7 +542,52 @@ The step runs on the fastest of three backends, picked at startup:
 | **plain JS** (`gremlin-core.js`) | the reference | 462 ms/step |
 
 In the browser the WASM path takes the real `P0A7Y4` alignment from 2.1 to
-**7.1 steps/s**, so it settles in well under a minute instead of two.
+**7.1 steps/s**, so it settles in well under a minute instead of two. (Those
+numbers are from the original 4-core machine and predate the kernel changes
+below, which roughly halve the WASM step again.)
+
+### Second pass on the WASM kernels
+
+Timed per kernel with `node test/bench-step.mjs` (Apple M2, L=155, B=128), the
+step was 49 ms: data pass 28, Adam 18, symmetrize 3. Adam was entirely scalar,
+because its double-precision sum of squares is a reduction clang will not
+reorder without `-ffast-math`. Three changes, each bit-identical in W to
+what it replaces (checked word for word over 10.6M parameters after 35 steps):
+
+- **Adam fused with symmetrize, over the `i<j` half only.** W, G, m and v are
+  exactly symmetric, so the elementwise update did every computation twice. Now
+  each block pair is symmetrized while hot, Adam runs vectorized on the
+  contiguous `i<j` block, and the result is transposed into `j<i`. The lower
+  halves of m and v are simply never read. 18 + 3 ms → 10 ms.
+- **Data pass loops sequences outside positions, within each row.** One
+  sequence's logits now stay in `ceil(A/4)` f32x4 registers for the whole
+  sweep over j, instead of being reloaded and stored for every (j, n). The
+  summation order per element is unchanged. G is zeroed one row-slab at a time,
+  just before that slab is accumulated, instead of in a separate 42MB pass.
+  28 ms → 20 ms.
+- **Contact map vectorized.** 13 ms → 3–5 ms. It runs on every ~10 Hz snapshot,
+  so at the new step rate it was costing ~12% of throughput.
+
+| L | B | before | after | |
+| --- | --- | --- | --- | --- |
+| 64 | 128 | 13.3 ms | 6.3 ms | 2.1× |
+| 155 | 128 | 53.4 ms | 31.1 ms | 1.7× |
+| 155 | 512 | 237 ms | 132 ms | 1.8× |
+| 250 | 128 | 209 ms | 123 ms | 1.7× |
+
+(Interleaved A/B runs on a loaded machine. Absolute times varied by ±30%
+between sessions but the ratios held.) Tried and dropped: processing two
+sequences per inner iteration for more loads in flight was worth ~2%, within
+noise. What remains of the data pass looks bound by latency on its scattered row
+reads, not by instruction count.
+
+Two allocator bugs turned up along the way. The worker bump-allocated each new
+model above the last and never released the old one, so every re-init (a new
+alignment, re-applied filters) leaked 4·P floats, about 170MB at L=155, toward
+wasm32's 4GB limit. It now calls `release()` before building a model. And
+allocations were not zeroed, so a model built on reused memory inherited the
+previous one's Adam moments. That was visible as the self-test failing the
+real backend on a second run. Both have regression tests.
 
 The active backend is shown as a badge next to the Start button; hover it to see
 what was tried and why.
@@ -725,6 +771,10 @@ What is left:
 - **Multiple workers.** The step parallelizes over positions with no shared
   writes until the symmetrize pass, so 4 workers should be close to linear. This
   is the largest untapped win that can actually be tested in a browser today.
+  The catch is that sharing W between workers needs `SharedArrayBuffer`, which
+  needs cross-origin isolation (COOP/COEP headers). `python3 -m http.server` and
+  GitHub Pages don't send those, so it would need a service-worker shim or a
+  different host.
 - **WebGPU**, once someone runs it on real hardware. The step is two
   matmul-shaped passes, ~29 GFLOP at L=128/N=1000, i.e. tens of milliseconds on
   an integrated GPU.
@@ -742,6 +792,7 @@ The two measurements the design rests on, as standalone scripts:
 ```sh
 node test/bench-original-vs-onehot.mjs   # the O(A) waste, and element counts
 node test/bench-loop-order.mjs           # sequence-major vs position-major
+node test/bench-step.mjs [L] [B] [N]     # WASM step, per kernel
 ```
 
 Both verify their fast path against the original before timing it, so the

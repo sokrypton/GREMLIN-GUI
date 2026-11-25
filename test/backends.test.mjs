@@ -103,9 +103,15 @@ await test('a corrupted coupling gradient is rejected', async () => {
 });
 
 await test('a skipped symmetrization is rejected', async () => {
+  // sym_adam fuses symmetrize into Adam; the unfused full-size adam over the
+  // raw gradient is exactly "the same step, never symmetrized"
   const fake = Object.create(Object.getPrototypeOf(wasm));
   Object.assign(fake, wasm);
-  fake.x = Object.assign({}, wasm.x, { symmetrize: function () { /* no-op */ } });
+  fake.x = Object.assign({}, wasm.x, {
+    sym_adam: function (Wp, Gp, Mp, Vp, L, A, lr, b1, b2, eps, i1, i2, gW) {
+      return wasm.x.adam(Wp, Gp, Mp, Vp, L * L * A * A, lr, b1, b2, eps, i1, i2, gW);
+    }
+  });
   const dev = await core.selfTest(fake);
   console.log('       deviation ' + dev.toExponential(2) + ' -> ' + (dev > core.SELFTEST_TOL ? 'rejected' : 'ACCEPTED'));
   assert.ok(dev > core.SELFTEST_TOL, 'gate accepted an unsymmetrized gradient');
@@ -115,11 +121,11 @@ await test('a wrong Adam update is rejected', async () => {
   const fake = Object.create(Object.getPrototypeOf(wasm));
   Object.assign(fake, wasm);
   fake.x = Object.assign({}, wasm.x, {
-    adam: function (Wp, Gp, Mp, Vp, P, lr) {
+    sym_adam: function (Wp, Gp, Mp, Vp, L, A, lr) {
       // right shape, wrong learning rate -- the kind of bug a bad uniform gives
-      return wasm.x.adam(Wp, Gp, Mp, Vp, P, lr * 1.5,
-                         arguments[6], arguments[7], arguments[8],
-                         arguments[9], arguments[10], arguments[11]);
+      return wasm.x.sym_adam(Wp, Gp, Mp, Vp, L, A, lr * 1.5,
+                             arguments[7], arguments[8], arguments[9],
+                             arguments[10], arguments[11], arguments[12]);
     }
   });
   const dev = await core.selfTest(fake);
@@ -141,6 +147,31 @@ await test('a wrong contact map is rejected', async () => {
   const dev = await core.selfTest(fake);
   console.log('       deviation ' + dev.toExponential(2) + ' -> ' + (dev > core.SELFTEST_TOL ? 'rejected' : 'ACCEPTED'));
   assert.ok(dev > core.SELFTEST_TOL, 'gate accepted a wrong contact map');
+});
+
+await test('the gate gives the same verdict when run again', async () => {
+  // WASM views used to come back unzeroed, so a second probe inherited the
+  // first one's Adam moments and the real backend failed its own self-test
+  const a = await core.selfTest(wasm), b = await core.selfTest(wasm);
+  console.log('       first ' + a.toExponential(2) + ', second ' + b.toExponential(2));
+  assert.equal(a, b);
+});
+
+await test('release() lets a new model reuse the heap, starting clean', async () => {
+  const sim = MSA.synthetic({ L: 30, N: 300, A: 20, nPairs: 3, seed: 5 });
+  const ds = MSA.buildDataset(sim.text, {});
+  const mk = () => new Gremlin({ L: ds.L, A: ds.A, N: ds.N, seqs: ds.seqs, backend: wasm,
+                                cfg: { batch: 64, lr: 0.05 }, seed: 3 });
+  wasm.release();
+  const a = mk(); const top = wasm.ptr;
+  for (let s = 0; s < 10; s++) a.step();
+  const lossA = a.loss;
+  wasm.release();
+  const b = mk();
+  assert.equal(wasm.ptr, top, 'second model did not land on the same heap');
+  for (let s = 0; s < 10; s++) b.step();
+  assert.equal(b.loss, lossA, 'reused heap changed the trajectory');
+  wasm.release();
 });
 
 await test('selectBackend falls back to JS when WASM cannot load', async () => {

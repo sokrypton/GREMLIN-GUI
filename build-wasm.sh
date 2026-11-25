@@ -6,7 +6,7 @@
 # order and break agreement with the JS reference.
 set -e
 cd "$(dirname "$0")"
-clang --target=wasm32 -O3 -msimd128 -nostdlib \
+${CLANG:-clang} --target=wasm32 -O3 -msimd128 -nostdlib \
       -Wl,--no-entry -Wl,--export-dynamic -Wl,--import-memory \
       -Wl,--initial-memory=1048576 \
       -o gremlin.wasm gremlin.c
