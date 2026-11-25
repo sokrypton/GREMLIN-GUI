@@ -61,8 +61,9 @@ CLANG=/opt/homebrew/opt/llvm/bin/clang ./build-wasm.sh   # Apple's clang has no 
 The practical page builds alignments with the ColabFold MMseqs2 server
 (`api.colabfold.com`, the same API ColabFold and localfold use; `mmseqs.js`).
 Enter a UniProt accession — its sequence is looked up on UniProt first — or
-paste a sequence, or upload an a3m/FASTA. The **Demo** button searches
-`P0A7Y4`, *E. coli* RNase HI. The query is sent to that public server, which is
+paste a sequence, or upload an a3m/FASTA. The box opens with the example
+`P0A7Y4`, *E. coli* RNase HI, preloaded, so **Search MMseqs2** works with one
+click. The query is sent to that public server, which is
 shared and rate-limited, so the page runs one search at a time and polls every
 5–10 s. The server caches by query, so a repeat search takes seconds.
 
@@ -75,7 +76,7 @@ prediction instead. AFDB's `/files/` path began answering 403 to everything,
 including URLs its own API still lists, so that path was removed. The precision
 tables below that say "AFDB" were measured on that alignment and the AlphaFold
 model. On the MMseqs2 alignment, scored against the 2RN2 crystal structure, the
-shipped config gives **74.2 / 77.9 / 64.5%** at top L/5, L/2 and L (CB < 8 Å),
+shipped config gives **74.2 / 77.9 / 65.2%** at top L/5, L/2 and L (CB < 8 Å),
 against 80.6 / 79.2 / 68.4% before. Both the alignment and the structure
 changed, so the two rows are not a like-for-like comparison.
 
@@ -264,7 +265,7 @@ exactly one of them back off:
 | ablate: gaps back in the norm | 80.6% | 76.6% | 65.8% |
 | ablate: bias starts at zero | 80.6% | 77.9% | 65.8% |
 | ablate: old fixed lr 0.05 | 77.4% | 77.9% | 64.5% |
-| ablate: 2× coupling penalty | 80.6% | 77.9% | 67.7% |
+| ablate: 2× coupling penalty (*= the reference, see below*) | 80.6% | 77.9% | 67.7% |
 
 - **Gap state excluded from the contact norm.** The reference takes the
   Frobenius norm over the 20×20 amino-acid block — *"note: we ignore gaps"*.
@@ -272,8 +273,19 @@ exactly one of them back off:
 - **Bias initialized from single-site log frequencies**, `log(counts +
   0.01·log N)` centred per column, instead of zeros. The conditionals then start
   out already explaining column composition.
-- **The coupling penalty carries a 0.5.** Ours was 2× the reference at the same
-  α.
+- **The coupling penalty: matching the reference's value was not enough.**
+  The 0.5 in `λ_w` makes our reported penalty equal the reference's. But what
+  Adam acts on is the gradient, and there the 0.5 overshot. A coupling is one
+  free parameter stored twice. Each copy's data gradient is the symmetrized sum
+  `G_ij + G_jiᵀ`, the full derivative for that parameter. So the penalty's must
+  be too, and `Σ W²` holds the parameter twice: `d/dθ [λ·2θ²] = 4λθ`. The code
+  used `2λθ`, which weighted the penalty at **half** the reference's relative to
+  the data. The reference trains an unsymmetrized `r` and uses `e = (r + rᵀ)/2`,
+  so its gradient is `½(G + Gᵀ) + 2c·e`: the same direction as ours with `4λ`.
+  `test/core.test.mjs` now checks the direction of our update vector against
+  finite differences of the reference objective (cos 1 − 1e-9; it was 0.989).
+  Fixed Nov 2026. So the table's "2× coupling penalty" row is the exact
+  reference, and the bold row was half of it.
 - **Learning rate `0.1·log(batch)/L`.** The pseudo-likelihood sums L conditionals
   per sequence, so a rate tuned at L=48 overshoots at L=155 — the ablation row
   above is a fixed 0.05, which is 16× the formula at L=155. The practical page
@@ -281,6 +293,29 @@ exactly one of them back off:
   [below](#does-the-calibration-hold-across-length-and-depth): a 12-protein sweep
   finds the optimum is a *broad basin*, so this row is about not being far wrong
   rather than about the `1/L` exponent being finely tuned.
+
+Re-measured after that fix, on the inputs available now (MMseqs2 alignment,
+2RN2 crystal structure; `test/fetch-demo-data.mjs`). The penalty rows are the
+point. On one deep alignment the two settings are a pair apart either way:
+
+| | top L/5 | top L/2 | top L |
+| --- | --- | --- | --- |
+| before | 74.2% | 75.3% | 62.6% |
+| **all four changes, reference penalty (ships)** | **74.2%** | **77.9%** | **65.2%** |
+| ablate: gaps back in the norm | 74.2% | 77.9% | 64.5% |
+| ablate: bias starts at zero | 74.2% | 79.2% | 65.2% |
+| ablate: old fixed lr 0.05 | 71.0% | 74.0% | 65.2% |
+| ablate: half penalty (shipped until Nov 2026) | 74.2% | 77.9% | 64.5% |
+
+The 12-protein calibration sweep below says more, and it is mixed. It was run
+under the old gradient, so its α multipliers are worth half what they are now:
+its ×2 column *is* the reference setting. Read that way, the reference's penalty
+does better on shallow alignments (Meff ≈ 110: +2.6 against +1.1 for the old
+default), the same near Meff 400, and worse on deep ones (Meff ≈ 1200: −0.2
+against +2.1; full depth: −2.4 against −1.0). The sweep's fitted optimum is
+about a third of the reference's penalty at Meff 700, and less deeper. We match
+the reference anyway, so α means what it does there. The sweep is the evidence
+for lowering α on deep alignments.
 
 One deliberate deviation: we zero-sum gauge-fix each block before taking the
 norm; the reference relies on L2 to pin the gauge implicitly. Re-measured under
@@ -353,6 +388,13 @@ thing a single protein cannot check:
 lr    = 0.1·log(B)/L                 shrinks with length
 λ_w   = 0.5·α·(L−1)(A−1)/Meff        grows with length, falls with depth
 ```
+
+> **Units.** This sweep ran before the coupling-penalty gradient was corrected
+> (see "Matching the reference"), when the penalty was half the reference's at
+> the same α. Halve every α multiplier below to read it in today's units: the
+> old ×1 is today's ×0.5, the old ×2 is today's ×1 (the reference), and the
+> fitted `m* = 0.688·(Meff/700)^−0.44` is `0.344·(Meff/700)^−0.44` now. The lr
+> results are unaffected.
 
 So both were swept as a **multiplier** over 12 proteins (L = 70–270, AlphaFold DB
 models plus the alignments those models were built from). A calibrated formula

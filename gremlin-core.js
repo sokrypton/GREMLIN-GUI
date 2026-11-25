@@ -41,14 +41,14 @@
  *   J/Meff = (1/Meff) sum_n w_n sum_i -log p_i(x_ni)
  *            + (lam_w/Meff) sum W^2  +  (lam_b/Meff) sum b^2
  *
- *   lam_w = alpha * (L-1) * (A-1)      alpha default 0.01
+ *   lam_w = 0.5 * alpha * (L-1) * (A-1)   alpha default 0.01
  *   lam_b = beta                       beta  default 0.01
  *
  * The L-scaling on lam_w is what makes a single regularization knob behave the
  * same at L=8 and L=256; a bare constant (as in the original) is only ever
  * tuned for one size. `sum W^2` runs over the full symmetric tensor, so each
- * unique coupling is counted twice -- this matches GREMLIN's convention and is
- * consistent with the gradient (2*lam_w*W applied to each of the two copies).
+ * unique coupling is counted twice -- this matches GREMLIN's convention, and
+ * the gradient follows from it: 4*lam_w*W per coupling (see _penalty).
  *
  * Minibatching decouples cost from N: sequences are sampled with probability
  * w_n/Meff and each carries coefficient 1/B, which is an unbiased estimator of
@@ -763,6 +763,42 @@
     }
   };
 
+  /*
+   * Penalty weights, and the coefficient each one's gradient carries. Shared by
+   * every backend, so the CPU and GPU paths cannot drift apart (they did once:
+   * the GPU path missed a 0.5 for a while).
+   *
+   * Objective terms (what is reported as L2(w), L2(b)):
+   *   lamW * sum_full W^2,  lamB * sum b^2
+   * 'gremlin': lamW = 0.5*alpha*(L-1)*(A-1)/Meff, lamB = beta/Meff -- exactly the
+   *   reference's (sokrypton/laxy examples/gremlin_jax.ipynb)
+   *     l2 = 0.5*(L-1)*(A-1)*sum(w^2) + sum(b^2),  loss = cce.sum() + lam*l2
+   *   divided by Meff, since ours is a per-sequence mean and theirs a sum.
+   *
+   * Gradient coefficients. A coupling is ONE free parameter stored twice
+   * (W_ij(a,b) = W_ji(b,a)), and the step moves both copies by the same amount.
+   * The data gradient each copy receives is the symmetrized sum G_ij + G_ji^T,
+   * i.e. the full derivative with respect to that one parameter; so the
+   * penalty's must be too, and sum_full W^2 holds the parameter twice:
+   * d/dtheta [lamW * 2 theta^2] = 4 lamW theta. Hence gW = 4*lamW.
+   *
+   * This is what matches the reference, checked by finite differences of its
+   * objective in test/core.test.mjs. It trains an unsymmetrized r and uses
+   * e = (r + r^T)/2, so its gradient is 0.5*(G + G^T) + 2c*e: the same
+   * direction as ours, which Adam cannot tell apart. gW = 2*lamW, used until
+   * Nov 2026, weighted the penalty at half the reference's relative to the data.
+   *
+   * 'raw' (the educational page) keeps the original page's convention, where
+   * the gradient is exactly data + alpha*W: gW = 2*lamW = alpha.
+   */
+  Gremlin.prototype._penalty = function () {
+    var cfg = this.cfg, raw = cfg.regMode === 'raw';
+    var lamW = raw ? cfg.alpha / 2
+                   : 0.5 * cfg.alpha * (this.L - 1) * (this.A - 1) / this.Meff;
+    var lamB = raw ? cfg.beta / 2 : cfg.beta / this.Meff;
+    return { lamW: lamW, lamB: lamB, gW: (raw ? 2 : 4) * lamW, gB: 2 * lamB };
+  };
+
   /* Fused in-place Adam + L2. One pass, zero allocation, and the L2 sums come
      out for free -- the original allocated six full-size arrays per step. */
   Gremlin.prototype._adam = function (fusedSym) {
@@ -775,21 +811,9 @@
     var ibc2 = 1 / (1 - Math.pow(b2, this.t));
     var om1 = 1 - b1, om2 = 1 - b2;
 
-    /*
-     * The 0.5 matches the reference implementation (sokrypton/laxy
-     * examples/gremlin_jax.ipynb), which uses
-     *     l2 = 0.5*(L-1)*(A-1)*sum(w^2) + sum(b^2),  loss = cce.sum() + lam*l2
-     * with lam = 0.01. Its objective is the *sum* over sequences and ours is the
-     * Meff-normalized mean, so ours is exactly theirs divided by Meff -- same
-     * minimizer, and Adam is invariant to the constant. Without the 0.5 our
-     * coupling penalty was twice the reference's at the same alpha.
-     */
-    var raw = cfg.regMode === 'raw';
-    var lamW = raw ? cfg.alpha / 2
-                   : 0.5 * cfg.alpha * (this.L - 1) * (this.A - 1) / this.Meff;
-    var gW = 2 * lamW, sw2 = 0;
-    var lamB = raw ? cfg.beta / 2 : cfg.beta / this.Meff;
-    var gB = 2 * lamB, sb2 = 0;
+    var pen = this._penalty();
+    var lamW = pen.lamW, lamB = pen.lamB, gW = pen.gW, gB = pen.gB;
+    var sw2 = 0, sb2 = 0;
     var b = this.b, Gb = this.Gb, Mb = this.Mb, Vb = this.Vb, nb = b.length;
 
     /*
@@ -890,14 +914,10 @@
     this.t++;
     var ibc1 = 1 / (1 - Math.pow(cfg.b1, this.t));
     var ibc2 = 1 / (1 - Math.pow(cfg.b2, this.t));
-    var raw = cfg.regMode === 'raw';
-    // must match _adam exactly, including the reference's 0.5
-    var lamW = raw ? cfg.alpha / 2
-                   : 0.5 * cfg.alpha * (this.L - 1) * (this.A - 1) / this.Meff;
-    var lamB = raw ? cfg.beta / 2 : cfg.beta / this.Meff;
-    this._lamW = lamW; this._lamB = lamB;
+    var pen = this._penalty();                    // the same numbers _adam uses
+    this._lamW = pen.lamW; this._lamB = pen.lamB;
     return this.gpu.step(this, {
-      lr: cfg.lr, ibc1: ibc1, ibc2: ibc2, gW: 2 * lamW, gWb: 2 * lamB
+      lr: cfg.lr, ibc1: ibc1, ibc2: ibc2, gW: pen.gW, gWb: pen.gB
     }).then(function () {
       self.steps++;
       return self.loss;
@@ -911,8 +931,9 @@
     var self = this;
     return this.gpu.syncScalars(this).then(function (s) {
       self.pll = s.pll;
-      self.regW = self._lamW * s.sw2;
-      self.regB = self._lamB * s.sb2;
+      // _lamW/_lamB are set by the first step; before it W and b are untouched
+      self.regW = (self._lamW || 0) * s.sw2;
+      self.regB = (self._lamB || 0) * s.sb2;
       self.loss = self.pll + self.regW + self.regB;
       var live = self.L * (self.L - 1) * self.AA;
       self.rms = live > 0 ? Math.sqrt(s.sw2 / live) : 0;

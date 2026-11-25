@@ -614,6 +614,72 @@ test("regMode 'gremlin' scales the penalty by (L-1)(A-1)/Meff", () => {
   assert.ok(Math.abs(ratio - want) < 1e-3, 'ratio ' + ratio + ' != ' + want);
 });
 
+test('the step follows the reference gradient, penalty included', () => {
+  /*
+   * Finite differences of the reference objective itself (laxy MRF +
+   * gremlin_jax.ipynb): the free parameter is an unsymmetrized r, the model uses
+   * e = (r + r^T)/2 with the diagonal removed, and
+   *   J = sum_n sum_i -log softmax(b_i + sum_j e_ij[x_nj])[x_ni]
+   *       + lam * 0.5*(L-1)*(A-1) * sum(e^2)
+   * Adam is invariant to the gradient's overall scale but not to the balance
+   * between its terms, so what has to match is the DIRECTION of the vector the
+   * optimizer receives: G_sym + gW*W. Until Nov 2026 the penalty there carried
+   * half the reference's weight relative to the data (cos 0.989 on this probe);
+   * a value-only check of the objective could not see it.
+   */
+  const L = 5, A = 4, N = 6, alpha = 0.05;
+  let st = 99;
+  const rnd = () => ((st = (st * 1664525 + 1013904223) >>> 0) / 4294967296);
+  const seqs = new Int32Array(L * N).map(() => (rnd() * A) | 0);
+  const g = new Gremlin({ L, A, N, seqs, uniformWeights: true, biasInit: 'zero', gap: -1,
+                          cfg: { batch: N, alpha, beta: 0, lr: 0, regMode: 'gremlin' } });
+  for (let i = 0; i < L; i++) for (let j = i + 1; j < L; j++)
+    for (let a = 0; a < A; a++) for (let b = 0; b < A; b++) {
+      const c = rnd() - 0.5;
+      g.W[((i * L + j) * A + b) * A + a] = c;
+      g.W[((j * L + i) * A + a) * A + b] = c;
+    }
+  for (let k = 0; k < L * A; k++) g.b[k] = (rnd() - 0.5) * 0.3;
+  const W0 = Float64Array.from(g.W);
+  const idx = (i, j, b, a) => ((i * L + j) * A + b) * A + a;
+  const Jref = (R) => {
+    const E = new Float64Array(R.length);
+    for (let i = 0; i < L; i++) for (let j = 0; j < L; j++) if (i !== j)
+      for (let a = 0; a < A; a++) for (let b = 0; b < A; b++)
+        E[idx(i, j, b, a)] = 0.5 * (R[idx(i, j, b, a)] + R[idx(j, i, a, b)]);
+    let J = 0;
+    for (let n = 0; n < N; n++) for (let i = 0; i < L; i++) {
+      const lg = new Float64Array(A);
+      for (let a = 0; a < A; a++) {
+        lg[a] = g.b[i * A + a];
+        for (let j = 0; j < L; j++) if (j !== i) lg[a] += E[idx(i, j, seqs[n * L + j], a)];
+      }
+      const mx = Math.max(...lg);
+      let s = 0; for (const v of lg) s += Math.exp(v - mx);
+      J -= lg[seqs[n * L + i]] - mx - Math.log(s);
+    }
+    let e2 = 0; for (const v of E) e2 += v * v;
+    return J + alpha * 0.5 * (L - 1) * (A - 1) * e2;
+  };
+  const R = Float64Array.from(W0), ref = new Float64Array(R.length), h = 1e-5;
+  for (let k = 0; k < R.length; k++) {
+    const o = R[k];
+    R[k] = o + h; const p = Jref(R);
+    R[k] = o - h; const m = Jref(R);
+    R[k] = o; ref[k] = (p - m) / (2 * h);
+  }
+  g.step();                                   // lr 0: G now holds the data gradient
+  const gW = g._penalty().gW;
+  let d = 0, x = 0, y = 0;
+  for (let k = 0; k < R.length; k++) {
+    const ours = g.G[k] + gW * W0[k];
+    d += ours * ref[k]; x += ours * ours; y += ref[k] * ref[k];
+  }
+  const cos = d / Math.sqrt(x * y);
+  console.log('       cos(ours, reference) = ' + cos.toFixed(9));
+  assert.ok(cos > 1 - 1e-7, 'step direction differs from the reference gradient: cos ' + cos);
+});
+
 test('gap-filtered columns keep a slot in the display frame', () => {
   /*
    * Columns the gap filter drops still have to occupy space in a rendered

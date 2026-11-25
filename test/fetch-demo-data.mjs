@@ -5,7 +5,7 @@
  * RNase HI (UniProt P0A7Y4, 155 residues):
  *
  *   test.a3m  built by the ColabFold MMseqs2 server, exactly as the practical
- *             page's Demo button builds it (mmseqs.js)
+ *             page builds it (mmseqs.js)
  *   af.pdb    the crystal structure 2RN2 from RCSB, residues 1-155 -- the same
  *             numbering as the UniProt sequence
  *

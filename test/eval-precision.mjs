@@ -9,7 +9,7 @@
  * standard way DCA contact predictions are scored.
  *
  * Purpose: decide empirically whether aligning to the gremlin_jax reference
- * (gap-excluded norm, frequency bias init, 0.5 factor on the coupling penalty,
+ * (gap-excluded norm, frequency bias init, the reference's coupling penalty,
  * L-aware learning rate) actually predicts contacts better.
  */
 import { readFileSync, existsSync } from 'node:fs';
@@ -94,8 +94,10 @@ function precisionOf(rank, L, f) {
 function precision(g) { return precisionOf(ranking(g), g.L, isContact); }
 
 const CONFIGS = [
+  // alpha 0.01 under the current gradient (4*lamW per coupling) is exactly the
+  // penalty the code had before any of these changes
   { name: 'before (none of the four changes)',
-    gap: -1, biasInit: 'zero', alpha: 0.02, lr: 0.05 },
+    gap: -1, biasInit: 'zero', alpha: 0.01, lr: 0.05 },
   { name: 'all four changes (what ships)',
     gap: 20, biasInit: 'freq', alpha: 0.01, lr: null },
   { name: '  ablate: gaps back in the norm',
@@ -104,8 +106,9 @@ const CONFIGS = [
     gap: 20, biasInit: 'zero', alpha: 0.01, lr: null },
   { name: '  ablate: old fixed lr 0.05',
     gap: 20, biasInit: 'freq', alpha: 0.01, lr: 0.05 },
-  { name: '  ablate: 2x coupling penalty',
-    gap: 20, biasInit: 'freq', alpha: 0.02, lr: null }
+  // what shipped until Nov 2026: gradient 2*lamW, half the reference's weight
+  { name: '  ablate: half coupling penalty',
+    gap: 20, biasInit: 'freq', alpha: 0.005, lr: null }
 ];
 
 const STEPS = 400, B = 128;

@@ -55,6 +55,15 @@
   var tblRows = [];
   var tblLast = 0;
 
+  /*
+   * Preloaded so the page works with one click: E. coli RNase HI (UniProt
+   * P0A7Y4, 155 aa), the protein the README's precision numbers are measured on.
+   * The ColabFold server caches by query, so searching it again takes seconds.
+   */
+  var EXAMPLE = '>P0A7Y4 Ribonuclease HI, E. coli (example)\n'
+    + 'MLKQVEIFTDGSCLGNPGPGGYGAILRYRGREKTFSAGYTRTTNNRMELMAAIVALEALKEHCEVILSTDSQYVRQ'
+    + 'GITQWIHNWKKRGWKTADKKPVKNVDLWQRLDAALGQHQIKWEWVKGHAGHPENERCDELARAAAMNPTLEDTGYQVEV';
+
   /* ---------------------------------------------------------------- */
   /* skeleton                                                         */
   /* ---------------------------------------------------------------- */
@@ -68,21 +77,16 @@
 
   <div class="banner err" id="err" hidden></div>
 
-  <div class="card stats" id="stats"></div>
-  <div class="banner warn" id="memWarn" hidden></div>
-  <div class="banner info" id="meffWarn" hidden></div>
-
   <div class="card" style="margin-bottom:24px">
     <h2>Alignment</h2>
     <div class="note">Build an alignment with MMseqs2 from a UniProt accession or a pasted
       sequence (sent to the public ColabFold server, api.colabfold.com), or load your own
       FASTA / A3M.</div>
     <textarea id="acc" rows="3" spellcheck="false" autocomplete="off"
-      placeholder="UniProt accession (e.g. P0A7Y4), or paste a protein sequence / FASTA"></textarea>
+      placeholder="UniProt accession (e.g. P0A7Y4), or paste a protein sequence / FASTA">${EXAMPLE}</textarea>
     <div class="row" style="margin-top:8px">
       <button id="mmseqs">Search MMseqs2</button>
       <label class="file-btn">Load file<input type="file" id="file" accept=".a3m,.fa,.fasta,.afa,.aln,.txt"></label>
-      <button class="small" id="demo">Demo (RNase H)</button>
       <span class="small" id="src"></span>
     </div>
 
@@ -121,6 +125,11 @@
     </div>
   </div>
 
+  <!-- what the loaded alignment became: shown after it, before the run controls -->
+  <div class="card stats" id="stats"></div>
+  <div class="banner warn" id="memWarn" hidden></div>
+  <div class="banner info" id="meffWarn" hidden></div>
+
   <div class="card" style="margin-bottom:24px">
     <h2>Optimization</h2>
     <div class="note" id="pace"></div>
@@ -141,9 +150,6 @@
     <div class="card">
       <h2>Contact map</h2>
       <div class="note mono">APC(L2norm(gauge-fixed <span class="w">w</span>))</div>
-      <div class="row" style="margin-bottom:10px">
-        <label class="small">min |i-j| <input type="number" id="minSep" min="1" max="30"></label>
-      </div>
       <div id="cmWrap"><canvas id="cmCv" class="clickable"></canvas></div>
       <div class="tiny" id="cmNote"></div>
     </div>
@@ -157,6 +163,8 @@
       <div class="card">
         <h2>Ranked contacts</h2>
         <div class="row" style="justify-content:space-between;margin-bottom:8px">
+          <!-- filters the list and the CSV only; the map always shows every pair -->
+          <label class="small">min |i-j| <input type="number" id="minSep" min="1" max="30"></label>
           <span class="small" id="tblNote"></span>
           <button class="small" id="dl">download CSV</button>
         </div>
@@ -940,7 +948,8 @@
     $('mmseqs').disabled = true;
     S.err = null;
     var isSeq = MMseqs.looksLikeSequence(input);
-    var label = isSeq ? 'sequence' : input.toUpperCase();
+    var head = /^>\s*(\S+)/.exec(input);
+    var label = isSeq ? (head ? head[1] : 'sequence') : input.toUpperCase();
     function show(msg) { S.status = msg; S.source = msg; renderAll(); }
     show(isSeq ? 'MMseqs2: submitting…' : 'looking up ' + label + ' on UniProt…');
     (isSeq ? Promise.resolve(input) : MMseqs.uniprotSequence(input)).then(function (seq) {
@@ -971,12 +980,7 @@
   $('acc').addEventListener('keydown', function (e) {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); searchMmseqs($('acc').value); }
   });
-  /* The ColabFold server caches by query, so a repeated demo search returns in
-     seconds. */
-  $('demo').addEventListener('click', function () {
-    $('acc').value = 'P0A7Y4';
-    searchMmseqs('P0A7Y4');
-  });
+
 
   $('file').addEventListener('change', function (e) {
     var f = e.target.files && e.target.files[0];
@@ -1009,7 +1013,6 @@
     S.minSep = Math.max(1, Math.min(30, Number(e.target.value) || 1));
     e.target.value = S.minSep;
     refreshTable(true);
-    drawContacts();
   });
 
   var rz = null;
