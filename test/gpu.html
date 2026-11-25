@@ -47,7 +47,16 @@ async function agree(be, L, B, steps) {
   const W = await be.readback(be.b.W, Math.min(gpu.P, 1 << 22));
   let wd = 0, ws = 0;
   for (let k = 0; k < W.length; k++) { wd = Math.max(wd, Math.abs(W[k] - ref.W[k])); ws = Math.max(ws, Math.abs(ref.W[k])); }
-  const r = { L, B, steps, lossRef: ref.loss, lossGpu: gpu.loss,
+  // one coupling block, raw and gauged, as the inspector requests it
+  let bd = 0;
+  for (const [i, j] of [[0, 1], [3, L - 1], [L - 1, 2]]) {
+    const [rb, gb] = [ref.block(i, j), await gpu.blockAsync(i, j)];
+    const [rg, gg] = [ref.blockGauged(i, j), await gpu.blockGaugedAsync(i, j)];
+    for (let k = 0; k < rb.length; k++) bd = Math.max(bd, Math.abs(rb[k] - gb[k]), Math.abs(rg[k] - gg[k]));
+  }
+  log(`  blocks (raw + gauged, 3 pairs): max |d| ${bd.toExponential(2)}`);
+  if (!(bd < 1e-4)) throw new Error('GPU coupling block disagrees with CPU: ' + bd);
+  const r = { L, B, steps, lossRef: ref.loss, lossGpu: gpu.loss, dBlock: bd,
               dLoss: Math.abs(ref.loss - gpu.loss) / Math.abs(ref.loss),
               maxW: ws, dW: wd, maxCm: top, dCm: cm };
   log(`agree L=${L} B=${B} ${steps} steps: loss ${ref.loss.toFixed(5)} vs ${gpu.loss.toFixed(5)}`
@@ -62,7 +71,10 @@ async function speed(be, name, L, B, steps) {
   if (be && be.release) be.release();
   const g = new Gremlin({ L, A, N, seqs, uniformWeights: true, backend: be,
                           cfg: { batch: B, lr: Gremlin.suggestLr(L, B) } });
-  for (let s = 0; s < 3; s++) await g.stepAsync();
+  // warm up for a second, not a few steps: a freshly compiled WASM module runs
+  // on V8's baseline tier until its optimized code lands, ~5x slower here
+  const tw = performance.now();
+  while (performance.now() - tw < 1000) await g.stepAsync();
   await g.contactMapAsync();
   const t0 = performance.now();
   for (let s = 0; s < steps; s++) await g.stepAsync();

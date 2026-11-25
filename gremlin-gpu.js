@@ -566,20 +566,43 @@ fn main(@builtin(workgroup_id) wid : vec3<u32>,
     c.end();
   };
 
-  /* Copy `n` floats from a GPU buffer. Serialized on `read`, so callers must
-     not overlap readbacks. */
+  /*
+   * Run one read operation after every earlier one has finished.
+   *
+   * The worker's message handler and its training loop interleave at every
+   * await, so a click (a coupling block, a contact list) can arrive while a
+   * snapshot is mid-readback. Two overlapping readbacks map the one staging
+   * buffer twice -- "Buffer already has an outstanding map pending" -- and,
+   * worse, sum() and contactMap() stage their results in shared scratch
+   * buffers (`part`, `F`) before reading them, so an interleaved second call
+   * could overwrite the first's result before it is copied out. So the unit
+   * that is serialized is the whole operation, not just the map.
+   */
+  GpuBackend.prototype._serial = function (fn) {
+    var p = (this.q || Promise.resolve()).then(fn);
+    this.q = p.catch(function () {});        // a failed read must not wedge the queue
+    return p;
+  };
+
+  /* Copy `n` floats from a GPU buffer. */
   GpuBackend.prototype.readback = function (buf, n, off) {
-    var d = this.device, self = this, out = new Float32Array(n);
+    var self = this;
+    return this._serial(function () { return self._readback(buf, n, off); });
+  };
+
+  /* Unserialized; only for use inside a _serial operation. */
+  GpuBackend.prototype._readback = function (buf, n, off) {
+    var d = this.device, rd = this.read, rn = this.readN, out = new Float32Array(n);
     off = off || 0;
     function chunk(done) {
       if (done >= n) return Promise.resolve(out);
-      var c = Math.min(n - done, self.readN);
+      var c = Math.min(n - done, rn);
       var enc = d.createCommandEncoder();
-      enc.copyBufferToBuffer(buf, (off + done) * 4, self.read, 0, c * 4);
+      enc.copyBufferToBuffer(buf, (off + done) * 4, rd, 0, c * 4);
       d.queue.submit([enc.finish()]);
-      return self.read.mapAsync(GPUMapMode.READ, 0, c * 4).then(function () {
-        out.set(new Float32Array(self.read.getMappedRange(0, c * 4)), done);
-        self.read.unmap();
+      return rd.mapAsync(GPUMapMode.READ, 0, c * 4).then(function () {
+        out.set(new Float32Array(rd.getMappedRange(0, c * 4)), done);
+        rd.unmap();
         return chunk(done + c);
       });
     }
@@ -645,7 +668,7 @@ fn main(@builtin(workgroup_id) wid : vec3<u32>,
     var enc = this.device.createCommandEncoder();
     this.pass(enc, 'reduce', [src, this.b.part], S.REDUCE_WG);
     this.device.queue.submit([enc.finish()]);
-    return this.readback(this.b.part, S.REDUCE_WG).then(function (p) {
+    return this._readback(this.b.part, S.REDUCE_WG).then(function (p) {
       var s = 0;
       for (var i = 0; i < p.length; i++) s += p[i];
       return s;
@@ -654,6 +677,10 @@ fn main(@builtin(workgroup_id) wid : vec3<u32>,
 
   /** -PLL and sum(w^2), sum(b^2) for the reported loss breakdown. */
   GpuBackend.prototype.syncScalars = function (g) {
+    var self = this;
+    return this._serial(function () { return self._syncScalars(g); });
+  };
+  GpuBackend.prototype._syncScalars = function (g) {
     var self = this, out = {};
     return this.sum(g, this.b.Loss, g.B * g.L).then(function (pll) {
       out.pll = pll;
@@ -674,13 +701,17 @@ fn main(@builtin(workgroup_id) wid : vec3<u32>,
    * readback is also this step's queue drain point.
    */
   GpuBackend.prototype.contactMap = function (g) {
+    var self = this;
+    return this._serial(function () { return self._contactMap(g); });
+  };
+  GpuBackend.prototype._contactMap = function (g) {
     var b = this.b, L = g.L;
     this.writeCfg(g, { P: L * L });
     var enc = this.device.createCommandEncoder();
     this.pass(enc, 'frob', [b.W, b.F], L, L);
     this.device.queue.submit([enc.finish()]);
 
-    return this.readback(b.F, L * L).then(function (F) {
+    return this._readback(b.F, L * L).then(function (F) {
       // same arithmetic as the CPU paths: f32 row sums, f64 total
       var rs = new Float32Array(L), tot = 0, i, j, r;
       for (i = 0; i < L; i++) {
@@ -708,15 +739,17 @@ fn main(@builtin(workgroup_id) wid : vec3<u32>,
 
   GpuBackend.prototype.syncW = function (g) {
     if (g.P > this.SYNC_MAX) return Promise.resolve(false);
-    if (!this.dirtyW) return Promise.resolve(true);
     var self = this;
-    return this.readback(this.b.W, g.P).then(function (w) {
-      g.W.set(w);
-      return self.readback(self.b.bias, g.L * g.A);
-    }).then(function (bb) {
-      g.b.set(bb);
-      self.dirtyW = false;
-      return true;
+    return this._serial(function () {
+      if (!self.dirtyW) return true;
+      return self._readback(self.b.W, g.P).then(function (w) {
+        g.W.set(w);
+        return self._readback(self.b.bias, g.L * g.A);
+      }).then(function (bb) {
+        g.b.set(bb);
+        self.dirtyW = false;
+        return true;
+      });
     });
   };
 
@@ -731,9 +764,15 @@ fn main(@builtin(workgroup_id) wid : vec3<u32>,
   GpuBackend.prototype.release = function () {
     this.inflight = null;
     if (!this.b) return;
-    for (var k in this.b) this.b[k].destroy();
-    if (this.read) this.read.destroy();
+    /* A snapshot may still be reading the old model's buffers; destroy them
+       once the read queue has drained, not under it. */
+    var old = this.b, oldRead = this.read;
     this.b = null; this.read = null;
+    (this.q || Promise.resolve()).then(function () {
+      for (var k in old) old[k].destroy();
+      if (oldRead) oldRead.destroy();
+    });
+    this.q = null;
   };
 
   root.GremlinGPU = { available: available, create: create, GpuBackend: GpuBackend };

@@ -925,9 +925,28 @@
     return this.gpu.contactMap(this);
   };
 
+  /*
+   * The device holds W in stored order, W[(i*L+j)*AA + b*A + a]; block() and
+   * blockGauged() hand back [a*A + b]. Read just the one block -- the whole of W
+   * is never copied back for a large model -- and reorder or gauge it here with
+   * the same code the CPU path uses.
+   */
   Gremlin.prototype.blockAsync = function (i, j) {
     if (!this.gpu) return Promise.resolve(this.block(i, j));
-    return this.gpu.blockAt(this, i, j);
+    var A = this.A, AA = this.AA, L = this.L;
+    if (i === j || i < 0 || j < 0 || i >= L || j >= L) return Promise.resolve(new Float32Array(AA));
+    return this.gpu.blockAt(this, i, j).then(function (raw) {
+      var out = new Float32Array(AA), a, bq;
+      for (a = 0; a < A; a++) for (bq = 0; bq < A; bq++) out[a * A + bq] = raw[bq * A + a];
+      return out;
+    });
+  };
+
+  Gremlin.prototype.blockGaugedAsync = function (i, j) {
+    if (!this.gpu) return Promise.resolve(this.blockGauged(i, j));
+    var self = this, L = this.L;
+    if (i === j || i < 0 || j < 0 || i >= L || j >= L) return Promise.resolve(new Float32Array(this.AA));
+    return this.gpu.blockAt(this, i, j).then(function (raw) { return self._gaugeBlock(raw, 0); });
   };
 
   /* Make the CPU-side helpers usable. Resolves false when the model is too big
@@ -1257,10 +1276,15 @@
    * comparable between pairs and the eye reads that arbitrariness as signal.
    */
   Gremlin.prototype.blockGauged = function (i, j) {
-    var L = this.L, A = this.A, AA = this.AA, W = this.W, nA = this.normA;
-    var out = new Float32Array(AA);
-    if (i === j || i < 0 || j < 0 || i >= L || j >= L) return out;
-    var o = (i * L + j) * AA, a, bq, w;
+    var L = this.L;
+    if (i === j || i < 0 || j < 0 || i >= L || j >= L) return new Float32Array(this.AA);
+    return this._gaugeBlock(this.W, (i * L + j) * this.AA);
+  };
+
+  /* Zero-sum gauge of the stored block at W[o ..], returned as [a*A + b]. */
+  Gremlin.prototype._gaugeBlock = function (W, o) {
+    var A = this.A, AA = this.AA, nA = this.normA;
+    var out = new Float32Array(AA), a, bq, w;
     var rowM = new Float64Array(A), colM = new Float64Array(A), all = 0;
     for (bq = 0; bq < nA; bq++) {
       for (a = 0; a < nA; a++) {
@@ -1545,6 +1569,13 @@
        * contact map crosses, which is 96KB at L=155 against 162MB for W.
        */
       var small = model.L * model.A <= 256;
+      /*
+       * heavyEvery throttles the coupling raster and top-K scan, which matter at
+       * real sizes. A model this small costs nothing to send in full, and
+       * thinning it made the weights panel and the network's coupling lines
+       * step at a third of the rate of everything else on the educational page.
+       */
+      if (small) heavy = true;
 
       var msg = {
         type: 'snapshot',
@@ -1774,10 +1805,8 @@
           if (model) {
             var blk;
             if (d.gauged) {
-              // blockGauged reads W on the CPU, so a GPU run has to mirror first
-              var okSync = await model.syncParams();
-              blk = okSync ? model.blockGauged(d.i | 0, d.j | 0)
-                           : new Float32Array(model.AA);
+              // on WebGPU this reads the one block back, never the whole of W
+              blk = await model.blockGaugedAsync(d.i | 0, d.j | 0);
             } else {
               blk = await model.blockAsync(d.i | 0, d.j | 0);
             }
