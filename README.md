@@ -537,9 +537,9 @@ The step runs on the fastest of three backends, picked at startup:
 
 | backend | status | speed at L=155, B=128 |
 | --- | --- | --- |
-| **WebGPU** (`gremlin-gpu.js`) | shaders validated, execution **unverified** — see below | not measured |
-| **WASM SIMD** (`gremlin.c` → `gremlin.wasm`) | measured | 117 ms/step (**3.9×** JS) |
-| **plain JS** (`gremlin-core.js`) | the reference | 462 ms/step |
+| **WebGPU** (`gremlin-gpu.js`) | measured (Chrome, Apple M2) | 8.7 ms/step (**3.6×** WASM) |
+| **WASM SIMD** (`gremlin.c` → `gremlin.wasm`) | measured | 31 ms/step (M2); 117 ms on the original 4-core machine |
+| **plain JS** (`gremlin-core.js`) | the reference | 462 ms/step (original machine) |
 
 In the browser the WASM path takes the real `P0A7Y4` alignment from 2.1 to
 **7.1 steps/s**, so it settles in well under a minute instead of two. (Those
@@ -621,18 +621,53 @@ Holding W as tightly as G would reject correct backends.
 
 ### About the WebGPU backend
 
-It has never been executed. The environment this was written in has no WebGPU:
-Playwright's Chromium ships with the API disabled (`navigator.gpu` is undefined
-under every flag combination, and there is no Vulkan driver to fall back on).
+It was written where WebGPU could not run, shipped behind the self-test, and has
+now been run on real hardware: Chrome 158 on an Apple M2 (Metal). Measured with
+`test/gpu.html` (serve the repo, open it; results also land in `window.out`):
 
-What it does have: all nine WGSL shaders are validated by
-[naga](https://github.com/gfx-rs/wgpu/tree/trunk/naga) in `test/wgsl.test.mjs`,
-which catches syntax, type, binding and control-flow errors and lowers each to
-SPIR-V. That does **not** catch a wrong index expression — which is exactly what
-the self-test gate above is for. The failure mode if a shader is wrong is that
-the probe disagrees, WebGPU refuses itself, and you silently get WASM.
+| L | B | WebGPU | WASM | |
+| --- | --- | --- | --- | --- |
+| 155 | 128 | 8.7 ms | 31.4 ms | 3.6× |
+| 155 | 512 | 23.1 ms | 79.1 ms | 3.4× |
+| 250 | 128 | 21.9 ms | 83.7 ms | 3.8× |
 
-Design notes, for whoever finishes it on real hardware:
+Against plain JS on the same random problem, the loss agrees to 5e-7 relative
+after 10 steps at L=155, W to 2e-7 absolute, and the contact map to 4e-7. In the
+practical page on a synthetic L=155 alignment with 12 planted couplings it runs
+at 100–113 steps/s and ranks exactly the 12 planted pairs first.
+
+The first real run is a case study in why the gate exists and where it stops.
+The self-test caught one bug and could not have caught the worst one:
+
+- **Caught:** the loss/L2 reduction wrote 256 partials into a buffer sized L²
+  floats, which at the probe's L=5 is 25. Command buffer dropped, deviation 1.0,
+  backend refused.
+- **Not catchable by a tiny probe:** symmetrize and Adam dispatched
+  `ceil(P/64)` workgroups in one dimension — 165,548 at L=155, over WebGPU's
+  65,535 limit. The probe's P is 400, so it passed; at real sizes the dispatch was
+  invalid and **the couplings never updated**, with no exception, because WebGPU
+  reports validation errors asynchronously. Dispatches now fold into 2D, and any
+  GPU error now fails the self-test and is collected in `errors`.
+- **Also fixed:** the frequency bias init was zeroed on upload; the coupling
+  penalty lacked the reference's 0.5 (2× the CPU paths'); `stepAsync` let the
+  worker queue hundreds of steps ahead of the device, so each snapshot waited
+  seconds for the backlog — a frozen display and an inflated steps/s.
+
+Kernel changes, measured one at a time on the device at L=155:
+
+| kernel | before | after | change |
+| --- | --- | --- | --- |
+| forward | 4.2 ms | 2.6 ms | 4 batch items per workgroup (was 1, leaving 11 of 32 lanes idle) |
+| backward | 3.1 ms | 2.9 ms | 4 position pairs per workgroup |
+| symmetrize + Adam | 1.3 ms + Adam | 3.1 ms fused | `i<j` half only, as on the CPU |
+| contact map | 6.2 ms | 1.7 ms | 32 threads per block (was 1); APC on the host, one readback |
+
+Tried and measured slower or within noise: staging the sequence in workgroup
+memory with an unrolled j loop (forward 1.3× slower), backward accumulators in
+workgroup memory (2.8× slower — the private `acc[b]` array was not spilling),
+D stored position-major, and a precomputed residue table for backward.
+
+Design notes:
 
 - W, G, m and v stay in device buffers for the whole run; W is 162MB at L=155, so
   the point is that it never crosses the bus. Only the L×L contact map (96KB)
@@ -641,9 +676,11 @@ Design notes, for whoever finishes it on real hardware:
   workgroup one ordered position pair and keeping the whole A×A block in
   registers: thread `a` holds `acc[b]` for all b, loops the batch accumulating
   `acc[x_nj] += d[n][i][a]`, then writes A² values once.
-- `stepAsync` only encodes and submits — it does not block. The periodic contact
-  map readback in the snapshot path doubles as the queue drain, which is what
-  stops submissions running arbitrarily far ahead of the device.
+- `stepAsync` encodes and submits, then waits only for the *previous* step, so
+  one step is always queued behind the one running and the host never gets
+  further ahead than that.
+- `test/wgsl.test.mjs` still validates every shader with naga when it is
+  installed, which is the only check that runs without a GPU.
 
 ## Performance notes
 
@@ -775,9 +812,10 @@ What is left:
   needs cross-origin isolation (COOP/COEP headers). `python3 -m http.server` and
   GitHub Pages don't send those, so it would need a service-worker shim or a
   different host.
-- **WebGPU**, once someone runs it on real hardware. The step is two
-  matmul-shaped passes, ~29 GFLOP at L=128/N=1000, i.e. tens of milliseconds on
-  an integrated GPU.
+- **WebGPU, further.** Now measured at 8.7 ms/step at L=155 on an M2. What is
+  left is mostly the fused Adam (memory-bound on 5 reads and 7 writes per
+  `i<j` element) and the backward pass. Untested so far: discrete GPUs, Windows
+  and Android, and models large enough to press on `maxStorageBufferBindingSize`.
 - **The redundancy filter** is still scalar JS — it is the one remaining place
   that spends double-digit seconds on a large alignment (+6s at 0.9). It is the
   same byte comparison `meff_counts` vectorizes, so the same treatment applies;

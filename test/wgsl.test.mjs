@@ -33,7 +33,7 @@ console.log('naga:', execFileSync(naga, ['--version'], { encoding: 'utf8' }).tri
 const dir = mkdtempSync(join(tmpdir(), 'wgsl-'));
 // Every shader the backend compiles. Kept in sync by asserting below that this
 // list covers exactly the keys GremlinGPUShaders exports.
-const names = ['forward', 'backward', 'biasgrad', 'sym', 'adam', 'adamb', 'frob', 'apc', 'reduce'];
+const names = ['forward', 'backward', 'biasgrad', 'symadam', 'adamb', 'frob', 'reduce'];
 
 let failed = 0;
 for (const n of names) {

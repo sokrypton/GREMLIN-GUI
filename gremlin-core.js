@@ -225,7 +225,9 @@
     // data_pass keeps a row of logits in at most six f32x4 registers
     var be = bk && bk.name === 'wasm' && this.A <= 24 ? bk : null;
     this.wasm = be;
-    this.gpu = bk && bk.name === 'webgpu' ? bk : null;
+    // the shaders size their per-state arrays at compile time
+    this.gpu = bk && bk.name === 'webgpu' && typeof GremlinGPUShaders !== 'undefined'
+               && this.A <= GremlinGPUShaders.MAX_A ? bk : null;
 
     /*
      * Batch buffers are allocated once at the largest batch the UI can request,
@@ -863,8 +865,8 @@
   /*
    * One uniform async API over all three backends, so the worker's loop does not
    * branch on which one is active. JS and WASM resolve immediately; WebGPU
-   * encodes and submits without blocking, and the queue is drained by the
-   * periodic contactMapAsync() readback.
+   * resolves once the previous step has finished on the device, so the host
+   * stays at most one step ahead of it.
    */
   Gremlin.prototype.stepAsync = function () {
     if (!this.gpu) return Promise.resolve(this.step());
@@ -875,7 +877,9 @@
     var ibc1 = 1 / (1 - Math.pow(cfg.b1, this.t));
     var ibc2 = 1 / (1 - Math.pow(cfg.b2, this.t));
     var raw = cfg.regMode === 'raw';
-    var lamW = raw ? cfg.alpha / 2 : cfg.alpha * (this.L - 1) * (this.A - 1) / this.Meff;
+    // must match _adam exactly, including the reference's 0.5
+    var lamW = raw ? cfg.alpha / 2
+                   : 0.5 * cfg.alpha * (this.L - 1) * (this.A - 1) / this.Meff;
     var lamB = raw ? cfg.beta / 2 : cfg.beta / this.Meff;
     this._lamW = lamW; this._lamB = lamB;
     return this.gpu.step(this, {
@@ -1360,6 +1364,8 @@
 
   function compareProbe(ref, cand, candG, candGb, cmB) {
     var worst = 0, k, d, scale;
+    // a dropped GPU command buffer leaves stale numbers that might still pass
+    if (cand.gpu && cand.gpu.errors && cand.gpu.errors.length) return Infinity;
     for (k = 0; k < ref.P; k++) {
       scale = Math.abs(ref.G[k]) + 1e-4;
       d = Math.abs(ref.G[k] - candG[k]) / scale;
@@ -1616,11 +1622,6 @@
         } while (running && t1 - t0 < budget);
 
         tickRate(t1);
-        /*
-         * On WebGPU this snapshot is also the queue drain: stepAsync only
-         * submits, so without a periodic readback the command queue would run
-         * arbitrarily far ahead of the device.
-         */
         if (t1 - lastSnap >= snapEveryMs) {
           lastSnap = t1;
           await snapshot((snapCount++ % heavyEvery) === 0);

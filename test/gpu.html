@@ -1,0 +1,109 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>GREMLIN WebGPU harness</title>
+<!--
+  Runs the WebGPU backend on the page's main thread (no worker) so it can be
+  driven and inspected from devtools:
+
+    python3 -m http.server 8000   # from the repo root
+    open http://localhost:8000/test/gpu.html
+
+  Every result also lands in window.out as JSON.
+-->
+<style>body { font: 13px ui-monospace, monospace; margin: 2em; } pre { white-space: pre-wrap; }</style>
+<pre id="log">loading...</pre>
+<script>
+// cache-busted, so an edit is always what runs
+const bust = '?t=' + Date.now();
+for (const f of ['gremlin-gpu.js', 'msa.js', 'gremlin-core.js'])
+  document.write('<script src="../' + f + bust + '"><\/script>');
+</script>
+<script>
+const logEl = document.getElementById('log');
+logEl.textContent = '';
+window.out = {};
+function log(s) { logEl.textContent += s + '\n'; console.log('[gpu] ' + s); }
+const core = GremlinCore, { Gremlin } = core;
+
+function randomSeqs(L, N, A, seed) {
+  let st = seed >>> 0;
+  const rnd = () => { st ^= st << 13; st >>>= 0; st ^= st >>> 17; st ^= st << 5; st >>>= 0; return st / 4294967296; };
+  const s = new Int32Array(N * L);
+  for (let k = 0; k < s.length; k++) s[k] = (rnd() * A) | 0;
+  return s;
+}
+
+/* Same problem on two backends, same steps: compare loss, W and the contact map. */
+async function agree(be, L, B, steps) {
+  const A = 21, N = 1000, seqs = randomSeqs(L, N, A, 99);
+  const mk = (backend) => new Gremlin({ L, A, N, seqs, uniformWeights: true, backend,
+                                        cfg: { batch: B, lr: Gremlin.suggestLr(L, B) }, seed: 5 });
+  const ref = mk(null), gpu = mk(be);
+  for (let s = 0; s < steps; s++) { ref.step(); await gpu.stepAsync(); }
+  await gpu.syncStats();
+  const cmR = ref.contactMap(), cmG = await gpu.contactMapAsync();
+  let cm = 0, top = 0;
+  for (let k = 0; k < cmR.length; k++) { cm = Math.max(cm, Math.abs(cmR[k] - cmG[k])); top = Math.max(top, Math.abs(cmR[k])); }
+  const W = await be.readback(be.b.W, Math.min(gpu.P, 1 << 22));
+  let wd = 0, ws = 0;
+  for (let k = 0; k < W.length; k++) { wd = Math.max(wd, Math.abs(W[k] - ref.W[k])); ws = Math.max(ws, Math.abs(ref.W[k])); }
+  const r = { L, B, steps, lossRef: ref.loss, lossGpu: gpu.loss,
+              dLoss: Math.abs(ref.loss - gpu.loss) / Math.abs(ref.loss),
+              maxW: ws, dW: wd, maxCm: top, dCm: cm };
+  log(`agree L=${L} B=${B} ${steps} steps: loss ${ref.loss.toFixed(5)} vs ${gpu.loss.toFixed(5)}`
+      + ` (rel ${r.dLoss.toExponential(2)}), |dW| ${wd.toExponential(2)} of ${ws.toFixed(3)},`
+      + ` |dCm| ${cm.toExponential(2)} of ${top.toFixed(3)}`);
+  return r;
+}
+
+/* Steps/s at a given size. GPU work is drained with a contact-map readback. */
+async function speed(be, name, L, B, steps) {
+  const A = 21, N = 2000, seqs = randomSeqs(L, N, A, 7);
+  if (be && be.release) be.release();
+  const g = new Gremlin({ L, A, N, seqs, uniformWeights: true, backend: be,
+                          cfg: { batch: B, lr: Gremlin.suggestLr(L, B) } });
+  for (let s = 0; s < 3; s++) await g.stepAsync();
+  await g.contactMapAsync();
+  const t0 = performance.now();
+  for (let s = 0; s < steps; s++) await g.stepAsync();
+  await g.contactMapAsync();
+  const ms = (performance.now() - t0) / steps;
+  const t1 = performance.now(); await g.contactMapAsync(); const cm = performance.now() - t1;
+  log(`speed ${name.padEnd(6)} L=${L} B=${B}: ${ms.toFixed(2)} ms/step (${(1000 / ms).toFixed(1)} steps/s), contact map ${cm.toFixed(1)} ms`);
+  return { name, L, B, ms, cm };
+}
+
+async function main() {
+  log('navigator.gpu: ' + !!navigator.gpu);
+  const ad = navigator.gpu && await navigator.gpu.requestAdapter();
+  if (ad) {
+    const info = ad.info || {};
+    log('adapter: ' + [info.vendor, info.architecture, info.description].filter(Boolean).join(' / '));
+    log('maxStorageBufferBindingSize ' + ad.limits.maxStorageBufferBindingSize
+        + ', maxBufferSize ' + ad.limits.maxBufferSize
+        + ', maxComputeWorkgroupsPerDimension ' + ad.limits.maxComputeWorkgroupsPerDimension);
+  }
+  const be = await GremlinGPU.create();
+  log('GremlinGPU.create: ' + (be ? 'ok' : 'null' + (GremlinGPU.lastError ? ' -- ' + GremlinGPU.lastError : '')));
+  if (!be) { out.done = true; return; }
+  const errs = [];
+  be.device.addEventListener('uncapturederror', (e) => { errs.push(e.error.message); log('GPU ERROR: ' + e.error.message); });
+  out.selfTest = await core.selfTest(be);
+  log('selfTest deviation ' + out.selfTest.toExponential(2) + ' (tol ' + core.SELFTEST_TOL + ')');
+
+  const q = new URLSearchParams(location.search);
+  if (!q.has('quick')) {
+    out.agree = [await agree(be, 40, 64, 20), await agree(be, 155, 128, 10)];
+    const wasm = await core.initWasm('../gremlin.wasm' + bust);
+    out.speed = [];
+    for (const [L, B] of [[155, 128], [155, 512], [250, 128]]) {
+      out.speed.push(await speed(be, 'webgpu', L, B, 30));
+      if (wasm) out.speed.push(await speed(wasm, 'wasm', L, B, 10));
+    }
+  }
+  out.errors = errs;
+  out.done = true;
+  log('done');
+}
+main().catch((e) => { log('FAILED: ' + (e && e.stack || e)); out.error = String(e); out.done = true; });
+</script>
