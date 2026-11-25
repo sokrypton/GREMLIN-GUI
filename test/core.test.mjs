@@ -553,11 +553,6 @@ test('sortByIdentity orders by descending identity with the query first', () => 
   assert.equal(ds.idn[0], 1);
 });
 
-test('afdbMsaUrl builds the path py2Dmol uses', () => {
-  assert.equal(MSA.afdbMsaUrl(' p0a7y4 '),
-    'https://alphafold.ebi.ac.uk/files/msa/AF-P0A7Y4-F1-msa_v6.a3m');
-});
-
 /* ---- educational page must stay numerically faithful to the original ---- */
 
 test("regMode 'raw' + uniformWeights reproduce the original's penalty exactly", () => {

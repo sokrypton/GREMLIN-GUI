@@ -272,6 +272,19 @@
       var mb2 = be.u8(this.N * this.mStride, 16);   // last: leaves ptr byte-aligned
       this.mSeq = mb2.v; this.pMSeq = mb2.p;
     } else {
+      /*
+       * Training elsewhere (WebGPU or JS) but a WASM module is on hand: borrow
+       * it for the exact SIMD Meff count only. Without this, choosing the GPU
+       * silently downgraded reweighting to the greedy-cluster approximation.
+       */
+      var mw = opts.meffWasm && opts.meffWasm.x && opts.meffWasm.x.meff_counts ? opts.meffWasm : null;
+      if (mw) {
+        this.meffWasm = mw;
+        this.mStride = (this.L + 15) & ~15;
+        mw.reserve(this.N * 4 + this.N * this.mStride + 16);
+        var mc0 = mw.f32(this.N); this.mCnt = mc0.v; this.pMCnt = mc0.p;
+        var ms0 = mw.u8(this.N * this.mStride, 16); this.mSeq = ms0.v; this.pMSeq = ms0.p;
+      }
       this.W = new Float32Array(this.P);
       this.G = new Float32Array(this.P);
       this.M = new Float32Array(this.P);
@@ -501,7 +514,8 @@
      * L bytes, and meff_counts needs the alignment for its v128 loads.
      */
     var stride = (L + 15) & ~15;
-    var wasmMeff = this.wasm && this.wasm.x.meff_counts && this.mSeq
+    var mx = this.wasm || this.meffWasm;
+    var wasmMeff = mx && mx.x.meff_counts && this.mSeq
                    && this.mStride === stride && this.mSeq.length >= N * stride;
     var bytes = wasmMeff ? this.mSeq : new Uint8Array(N * stride);
     var seqs = this.seqs, k;
@@ -554,7 +568,7 @@
       var CHUNK = 512, hi;
       for (n = 0; n < N; n += CHUNK) {
         hi = Math.min(n + CHUNK, N);
-        this.wasm.x.meff_counts(this.pMSeq, this.pMCnt, N, stride, L, need, n, hi);
+        mx.x.meff_counts(this.pMSeq, this.pMCnt, N, stride, L, need, n, hi);
         if (onProgress) onProgress(1 - Math.pow((N - hi) / N, 2));
       }
       cnt.set(this.mCnt.subarray(0, N));
@@ -1649,6 +1663,7 @@
      * accepted -- see selectBackend / selfTest.
      */
     var backendReady = null;
+    var meffWasm = null;
     function ensureBackend() {
       if (!backendReady) {
         backendReady = selectBackend({}).then(function (sel) {
@@ -1656,7 +1671,10 @@
           backendName = sel.name;
           backendTried = sel.tried;
           post({ type: 'backend', name: sel.name, tried: sel.tried });
-          return sel;
+          if (sel.name === 'wasm') return sel;
+          // the exact Meff kernel, for when training runs on another backend
+          return initWasm('gremlin.wasm').then(function (w) { meffWasm = w || null; return sel; },
+                                               function () { return sel; });
         });
       }
       return backendReady;
@@ -1698,9 +1716,10 @@
           post({ type: 'progress', phase: 'weights', frac: 0 });
           model = null;
           if (backend && backend.release) backend.release();   // one model at a time
+          if (meffWasm) meffWasm.release();
           model = new Gremlin({
             L: d.L, A: d.A, N: nSeq, seqs: seqs, cfg: d.cfg,
-            uniformWeights: d.uniformWeights, backend: backend,
+            uniformWeights: d.uniformWeights, backend: backend, meffWasm: meffWasm,
             gap: d.gap, biasInit: d.biasInit,
             identity: d.identity, maxRefs: d.maxRefs, seed: d.seed,
             weightMode: d.weightMode, filteredAt: filteredAt,

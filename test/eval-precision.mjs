@@ -1,6 +1,8 @@
 /*
- * Contact-precision evaluation against the AlphaFold structure for P0A7Y4
- * (E. coli RNase H, 155 residues -- same length as the AFDB a3m).
+ * Contact-precision evaluation for P0A7Y4 (E. coli RNase HI, 155 residues).
+ * The README's older tables used the AlphaFold DB model and a3m; AFDB's
+ * /files/ path now refuses requests, so the inputs are an MMseqs2 alignment
+ * and the 2RN2 crystal structure (test/fetch-demo-data.mjs).
  *
  * Ground truth: CB-CB (CA for Gly) < 8 A, |i-j| >= 5.
  * Metric: precision in the top L and top L/2 predicted pairs, which is the
@@ -13,16 +15,14 @@
 import { readFileSync, existsSync } from 'node:fs';
 
 /*
- * Needs two files this repo does not ship (they are ~4MB and not ours):
- *   af.pdb    https://alphafold.ebi.ac.uk/files/AF-P0A7Y4-F1-model_v6.pdb
- *   test.a3m  https://alphafold.ebi.ac.uk/files/msa/AF-P0A7Y4-F1-msa_v6.a3m
- * Put them next to this script, or pass a directory as argv[2].
+ * Needs two files this repo does not ship (af.pdb, test.a3m); write them with
+ *   node test/fetch-demo-data.mjs <dir>
+ * and pass that directory as argv[2].
  */
 const DIR = process.argv[2] || '.';
 if (!existsSync(DIR + '/af.pdb') || !existsSync(DIR + '/test.a3m')) {
   console.log('skipping: af.pdb and test.a3m not found in ' + DIR);
-  console.log('  curl -O https://alphafold.ebi.ac.uk/files/AF-P0A7Y4-F1-model_v6.pdb   # -> af.pdb');
-  console.log('  curl -O https://alphafold.ebi.ac.uk/files/msa/AF-P0A7Y4-F1-msa_v6.a3m # -> test.a3m');
+  console.log('  node test/fetch-demo-data.mjs ' + DIR + '   # MMseqs2 a3m + RCSB 2RN2');
   process.exit(0);
 }
 

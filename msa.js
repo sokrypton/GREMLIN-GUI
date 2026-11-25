@@ -43,13 +43,6 @@
   /* py2Dmol-compatible helpers                                          */
   /* ------------------------------------------------------------------ */
 
-  /* AlphaFold DB serves the a3m it used for each prediction. CORS is '*', so a
-     static page can fetch it directly; 404 means no MSA for that accession. */
-  function afdbMsaUrl(accession) {
-    return 'https://alphafold.ebi.ac.uk/files/msa/AF-'
-      + String(accession).trim().toUpperCase() + '-F1-msa_v6.a3m';
-  }
-
   // Matches py2Dmol's isGapResidue: unknown residues count as gaps for the
   // purpose of coverage and identity.
   function isGap(ch) {
@@ -557,7 +550,6 @@
     buildDataset: buildDataset,
     filterRedundancy: filterRedundancy,
     synthetic: synthetic,
-    afdbMsaUrl: afdbMsaUrl,
     isGap: isGap,
     coverageOf: coverageOf,
     identityTo: identityTo

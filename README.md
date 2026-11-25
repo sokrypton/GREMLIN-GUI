@@ -6,7 +6,7 @@ turned into a contact map. Two pages, one backend:
 | page | what it's for |
 | --- | --- |
 | [`index.html`](index.html) | **Educational.** The original toy visualization — every intermediate shown for a 4×3 digit alignment: one-hot input, couplings, bias, per-position softmax, the coupling matrix and the contact map. |
-| [`practical.html`](practical.html) | **Practical.** Real alignments from AlphaFold DB or your own FASTA/A3M, with one output: `APC(L2norm(gauge-fixed w))`, redrawn live as it converges. |
+| [`practical.html`](practical.html) | **Practical.** Real alignments built with MMseqs2, or your own FASTA/A3M, with one output: `APC(L2norm(gauge-fixed w))`, redrawn live as it converges. |
 
 No build step, no dependencies, no CDN. Workers need a real origin, so serve it:
 
@@ -33,15 +33,16 @@ test/                         node tests and benchmarks
 numerics are testable without a browser:
 
 ```sh
-node test/core.test.mjs        # numerics, MSA parsing, cost model  (26 tests)
-node test/backends.test.mjs    # WASM + the self-test gate          (25 tests)
+node test/core.test.mjs        # numerics, MSA parsing, cost model  (38 tests)
+node test/backends.test.mjs    # WASM + the self-test gate          (26 tests)
+node test/mmseqs.test.mjs      # MMseqs2 result archive -> a3m       (6 tests)
 node test/wgsl.test.mjs        # WGSL validation (needs naga; skips if absent)
-node test/eval-precision.mjs   # contact precision vs an AlphaFold structure
+node test/eval-precision.mjs   # contact precision vs a known structure
 ```
 
 `eval-precision.mjs` is how the four changes in "Matching the reference"
-below were decided; it needs two AFDB files it does not ship and prints how to
-fetch them.
+below were decided; it needs two files it does not ship, which
+`test/fetch-demo-data.mjs` writes.
 
 `core.test.mjs` checks the gradient against the *original* implementation
 (`test/naive.mjs`, kept verbatim as an oracle), the invariants, and end-to-end
@@ -57,14 +58,26 @@ CLANG=/opt/homebrew/opt/llvm/bin/clang ./build-wasm.sh   # Apple's clang has no 
 
 ## Getting an alignment
 
-The practical page fetches the a3m that AlphaFold DB used for its own prediction:
+The practical page builds alignments with the ColabFold MMseqs2 server
+(`api.colabfold.com`, the same API ColabFold and localfold use; `mmseqs.js`).
+Enter a UniProt accession — its sequence is looked up on UniProt first — or
+paste a sequence, or upload an a3m/FASTA. The **Demo** button searches
+`P0A7Y4`, *E. coli* RNase HI. The query is sent to that public server, which is
+shared and rate-limited, so the page runs one search at a time and polls every
+5–10 s. The server caches by query, so a repeat search takes seconds.
 
-```
-https://alphafold.ebi.ac.uk/files/msa/AF-<ACCESSION>-F1-msa_v6.a3m
-```
+The result is UniRef30 hits followed by the environmental databases
+(BFD/MGnify/MetaEuk/SMAG), with the query once at the top. For `P0A7Y4` that is
+16,403 sequences, 12,647 after the default filters.
 
-CORS is open, so no proxy is needed. Enter a UniProt accession (the **Demo**
-button loads `P0A7Y4`, *E. coli* RNase H) or upload a file.
+Until November 2026 the page fetched the a3m AlphaFold DB used for its own
+prediction instead. AFDB's `/files/` path began answering 403 to everything,
+including URLs its own API still lists, so that path was removed. The precision
+tables below that say "AFDB" were measured on that alignment and the AlphaFold
+model. On the MMseqs2 alignment, scored against the 2RN2 crystal structure, the
+shipped config gives **74.2 / 77.9 / 64.5%** at top L/5, L/2 and L (CB < 8 Å),
+against 80.6 / 79.2 / 68.4% before. Both the alignment and the structure
+changed, so the two rows are not a like-for-like comparison.
 
 Filtering follows [py2Dmol](https://github.com/sokrypton/py2Dmol) so the two
 agree on what an alignment is: a3m lowercase columns are insertions and are
@@ -840,7 +853,10 @@ Every contact-precision number in this README comes from one script, which needs
 two files it does not ship:
 
 ```sh
-curl -o af.pdb   https://alphafold.ebi.ac.uk/files/AF-P0A7Y4-F1-model_v6.pdb
-curl -o test.a3m https://alphafold.ebi.ac.uk/files/msa/AF-P0A7Y4-F1-msa_v6.a3m
-node test/eval-precision.mjs .           # ablations, plus all three ground truths
+node test/fetch-demo-data.mjs data       # MMseqs2 a3m + the 2RN2 crystal structure
+node test/eval-precision.mjs data        # ablations, plus all three ground truths
 ```
+
+The older tables were measured on AlphaFold DB's a3m and model, which AFDB no
+longer serves (see "Getting an alignment"). `test/calibration/fetch-data.sh`
+still points at AFDB, so the calibration sweep cannot currently be re-fetched.

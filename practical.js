@@ -2,8 +2,10 @@
  * practical.js -- the practical page: real alignments, one output that matters.
  *
  * Input follows py2Dmol's conventions so the two agree on what an alignment is:
- *   - AlphaFold DB serves the a3m it used, at
- *     https://alphafold.ebi.ac.uk/files/msa/AF-<ACC>-F1-msa_v6.a3m (CORS '*')
+ *   - alignments are built by the ColabFold MMseqs2 server from a sequence
+ *     (mmseqs.js); an accession is first turned into its sequence via UniProt.
+ *     (AlphaFold DB's own a3m files were the source until its /files/ path
+ *     began refusing requests in Nov 2026.)
  *   - a3m lowercase columns are insertions and are stripped on parse
  *   - coverage is the non-gap fraction of a row; identity is measured against
  *     the query; '-', '.', ' ' and 'X' all count as gaps
@@ -72,10 +74,13 @@
 
   <div class="card" style="margin-bottom:24px">
     <h2>Alignment</h2>
-    <div class="note">Fetch the MSA that AlphaFold DB used for a prediction, or load your own FASTA / A3M.</div>
-    <div class="row">
-      <input type="text" id="acc" placeholder="UniProt accession, e.g. P0A7Y4" size="26">
-      <button id="fetch">Fetch from AFDB</button>
+    <div class="note">Build an alignment with MMseqs2 from a UniProt accession or a pasted
+      sequence (sent to the public ColabFold server, api.colabfold.com), or load your own
+      FASTA / A3M.</div>
+    <textarea id="acc" rows="3" spellcheck="false" autocomplete="off"
+      placeholder="UniProt accession (e.g. P0A7Y4), or paste a protein sequence / FASTA"></textarea>
+    <div class="row" style="margin-top:8px">
+      <button id="mmseqs">Search MMseqs2</button>
       <label class="file-btn">Load file<input type="file" id="file" accept=".a3m,.fa,.fasta,.afa,.aln,.txt"></label>
       <button class="small" id="demo">Demo (RNase H)</button>
       <span class="small" id="src"></span>
@@ -920,37 +925,57 @@
     }, [copy.buffer]);
   }
 
-  function fetchAfdb(acc) {
-    acc = String(acc || '').trim().toUpperCase();
-    if (!acc) { S.err = 'Enter a UniProt accession first.'; renderAll(); return; }
+  /*
+   * Build the alignment with the ColabFold MMseqs2 server. The input may be a
+   * UniProt accession (looked up on UniProt first) or a sequence / FASTA. One
+   * search at a time: a second click while one is running is ignored, since
+   * the public server is shared and rate-limited.
+   */
+  var searching = false;
+  function searchMmseqs(input) {
+    if (searching) return;
+    input = String(input || '').trim();
+    if (!input) { S.err = 'Enter a UniProt accession or a protein sequence first.'; renderAll(); return; }
+    searching = true;
+    $('mmseqs').disabled = true;
     S.err = null;
-    S.status = 'fetching MSA for ' + acc + ' from AlphaFold DB…';
-    renderAll();
-    fetch(MSA.afdbMsaUrl(acc)).then(function (r) {
-      if (r.status === 404) {
-        throw new Error('AlphaFold DB has no MSA for ' + acc
-          + '. Check the accession, or upload an alignment instead.');
-      }
-      if (!r.ok) throw new Error('AlphaFold DB returned HTTP ' + r.status + ' for ' + acc + '.');
-      return r.text();
-    }).then(function (text) {
-      if (!text || !text.trim()) throw new Error('AlphaFold DB returned an empty MSA for ' + acc + '.');
-      S.text = text;
-      S.source = acc + ' · ' + UI.fmtInt((text.match(/^>/gm) || []).length) + ' sequences · '
-        + UI.fmtBytes(text.length);
+    var isSeq = MMseqs.looksLikeSequence(input);
+    var label = isSeq ? 'sequence' : input.toUpperCase();
+    function show(msg) { S.status = msg; S.source = msg; renderAll(); }
+    show(isSeq ? 'MMseqs2: submitting…' : 'looking up ' + label + ' on UniProt…');
+    (isSeq ? Promise.resolve(input) : MMseqs.uniprotSequence(input)).then(function (seq) {
+      seq = MMseqs.normalize(seq);
+      return MMseqs.search(seq, {
+        onProgress: function (p) {
+          show('MMseqs2 (' + seq.length + ' aa): ' + p.phase + ' · ' + Math.round(p.elapsed) + 's');
+        }
+      });
+    }).then(function (r) {
+      S.text = r.a3m;
+      S.source = label + ' · MMseqs2 · ' + UI.fmtInt((r.a3m.match(/^>/gm) || []).length)
+        + ' sequences · ' + UI.fmtBytes(r.a3m.length) + ' · ' + Math.round(r.seconds) + 's';
       build();
     }).catch(function (e) {
       S.err = e.message;
+      S.source = '';
       S.status = 'ready';
       renderAll();
+    }).then(function () {
+      searching = false;
+      $('mmseqs').disabled = false;
     });
   }
 
-  $('fetch').addEventListener('click', function () { fetchAfdb($('acc').value); });
-  $('acc').addEventListener('keydown', function (e) { if (e.key === 'Enter') fetchAfdb($('acc').value); });
+  $('mmseqs').addEventListener('click', function () { searchMmseqs($('acc').value); });
+  // Enter searches; Shift+Enter is a newline (pasted FASTA keeps its own)
+  $('acc').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); searchMmseqs($('acc').value); }
+  });
+  /* The ColabFold server caches by query, so a repeated demo search returns in
+     seconds. */
   $('demo').addEventListener('click', function () {
     $('acc').value = 'P0A7Y4';
-    fetchAfdb('P0A7Y4');
+    searchMmseqs('P0A7Y4');
   });
 
   $('file').addEventListener('change', function (e) {

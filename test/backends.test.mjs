@@ -390,6 +390,30 @@ await test('WASM makes the exact count the default, no approximation', async () 
     'cluster Meff ' + j.g.Meff + ' below exact ' + w.g.Meff);
 });
 
+await test('a non-WASM backend still gets the exact SIMD Meff via meffWasm', async () => {
+  // WebGPU trains on the device; reweighting must not fall back to clustering
+  const sim = MSA.synthetic({ L: 60, N: 5000, A: 20, nPairs: 3, seed: 77 });
+  const ds0 = MSA.buildDataset(sim.text, {});
+  // append 1500 exact copies so neighbourhoods exist and Meff < N
+  const dup = new Int32Array((ds0.N + 1500) * ds0.L);
+  dup.set(ds0.seqs); dup.set(ds0.seqs.subarray(0, 1500 * ds0.L), ds0.N * ds0.L);
+  const ds = { L: ds0.L, A: ds0.A, N: ds0.N + 1500, seqs: dup };
+  wasm.release();
+  const onW = new Gremlin({ L: ds.L, A: ds.A, N: ds.N, seqs: ds.seqs, backend: wasm, maxRefs: 3000 });
+  const exact = Array.from(onW.sw), meffW = onW.Meff;
+  wasm.release();
+  const helped = new Gremlin({ L: ds.L, A: ds.A, N: ds.N, seqs: ds.seqs, backend: null,
+                               meffWasm: wasm, maxRefs: 3000 });
+  const bare = new Gremlin({ L: ds.L, A: ds.A, N: ds.N, seqs: ds.seqs, backend: null, maxRefs: 3000 });
+  wasm.release();
+  assert.ok(meffW < ds.N - 1000, 'test data has no neighbours');
+  console.log('       N=' + ds.N + ': wasm ' + meffW.toFixed(1) + ', js+meffWasm ' + helped.Meff.toFixed(1)
+            + ' (' + helped.weightMode + '), js alone ' + bare.Meff.toFixed(1) + ' (' + bare.weightMode + ')');
+  assert.equal(helped.weightMode, 'exact');
+  assert.equal(helped.approxWeights, false);
+  assert.deepEqual(Array.from(helped.sw), exact);
+});
+
 /* ------------------------------------------------------------------ */
 section('4. reference conventions (sokrypton/laxy gremlin_jax.ipynb)');
 
